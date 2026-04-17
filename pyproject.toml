@@ -3,8 +3,7 @@
 
 [project]
 name = "gitcalver"
-# Static version; this package does not use its own Hatch plugin for versioning.
-version = "0.0.0"
+dynamic = ["version"]
 description = "Deterministic calendar versioning from git history"
 # Support all non-EOL Python versions.
 requires-python = ">=3.10"
@@ -19,6 +18,12 @@ gitcalver = "gitcalver._hatch_hooks"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "code"
+path = "src/gitcalver/__init__.py"
+expression = "get_version(dirty='+dirty')"
+search-paths = ["src"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gitcalver"]
