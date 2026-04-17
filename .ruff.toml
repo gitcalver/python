@@ -1,0 +1,37 @@
+# Copyright © 2026 Michael Shields
+# SPDX-License-Identifier: MIT
+
+# Match requires-python: support all non-EOL Python versions.
+target-version = "py310"
+
+[lint]
+select = [
+  "ALL",
+]
+
+ignore = [
+  "ANN401",  # typing.Any
+  "C90",     # Cyclomatic complexity
+  "D",       # pydocstyle (disable docstring rules)
+  "PLR09",   # "Too many" branches, arguments, etc.
+  "S603",    # subprocess output
+  "S607",    # subprocess using path
+  "T201",    # print()
+  "RUF001",  # ambiguous Unicode character in string
+  "RUF002",  # ambiguous Unicode character in docstring
+  "RUF003",  # ambiguous Unicode character in comment
+  "A002",    # shadowing builtins (dir, format) -- intentional API design
+  "COM812",  # trailing comma -- conflicts with formatter
+  "FBT",     # boolean arguments -- acceptable for internal functions
+  "PLC0415", # import not at top level -- intentional for lazy/circular imports
+]
+
+[lint.per-file-ignores]
+"tests/**" = [
+  "S101",     # assert
+  "PLR2004",  # magic values
+  "INP001",   # implicit namespace package (tests/ is intentionally not a package)
+]
+
+[lint.isort]
+known-local-folder = ["_helpers"]

@@ -1,0 +1,10 @@
+# Copyright © 2026 Michael Shields
+# SPDX-License-Identifier: MIT
+
+__pycache__/
+*.egg-info/
+.coverage
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
