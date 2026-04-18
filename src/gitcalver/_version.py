@@ -18,31 +18,37 @@ def is_version_string(s: str) -> bool:
 
 
 def _date_went_backwards(older: str, newer: str) -> ExitError:
-    return ExitError(
+    msg = (
         f"committer date not monotonic: "
         f"older commit dated {older} has a later date than "
-        f"newer commit dated {newer}",
+        f"newer commit dated {newer}"
     )
+    return ExitError(msg)
 
 
 def _validate_repo(dir: str | None) -> None:
     try:
         is_repo = _git.is_git_repo(dir=dir)
     except _git.GitError as e:
-        raise ExitError(str(e)) from e
+        msg = str(e)
+        raise ExitError(msg) from e
     if not is_repo:
-        raise ExitError("not a git repository")
+        msg = "not a git repository"
+        raise ExitError(msg)
     try:
         shallow = _git.is_shallow(dir=dir)
     except _git.GitError as e:
-        raise ExitError(f"cannot determine repository state: {e}") from e
+        msg = f"cannot determine repository state: {e}"
+        raise ExitError(msg) from e
     if shallow:
-        raise ExitError(
+        msg = (
             "shallow clone detected; full history is required"
-            " (use git fetch --unshallow)",
+            " (use git fetch --unshallow)"
         )
+        raise ExitError(msg)
     if not _git.has_commits(dir=dir):
-        raise ExitError("no commits in repository")
+        msg = "no commits in repository"
+        raise ExitError(msg)
 
 
 def forward(
@@ -73,16 +79,12 @@ def forward(
 
     if not is_on_branch(target_hash, branch_hash, dir=dir):
         if not is_head:
-            raise ExitError(
-                f"{revision} is not on the default branch ({branch_name})",
-                EXIT_WRONG_BRANCH,
-            )
+            msg = f"{revision} is not on the default branch ({branch_name})"
+            raise ExitError(msg, EXIT_WRONG_BRANCH)
         mb = _git.merge_base(target_hash, branch_hash, dir=dir)
         if mb is None:
-            raise ExitError(
-                f"HEAD is not traceable to the default branch ({branch_name})",
-                EXIT_WRONG_BRANCH,
-            )
+            msg = f"HEAD is not traceable to the default branch ({branch_name})"
+            raise ExitError(msg, EXIT_WRONG_BRANCH)
         off_branch = True
         version_rev = mb
 
@@ -112,7 +114,8 @@ def walk_first_parent(*, dir: str | None, rev: str) -> tuple[str, int]:
     with contextlib.closing(_git.first_parent_log(rev, dir=dir)) as entries:
         first = next(entries, None)
         if first is None:
-            raise ExitError("no commits found")
+            msg = "no commits found"
+            raise ExitError(msg)
         date = first[1]
         count = 1
 
@@ -140,7 +143,8 @@ def reverse(
 
     match = VERSION_RE.match(version_str)
     if not match:
-        raise ExitError(f"not a gitcalver version or git revision: {version_str}")
+        msg = f"not a gitcalver version or git revision: {version_str}"
+        raise ExitError(msg)
 
     date_str = match.group(1)
     n = int(match.group(2))
@@ -148,7 +152,8 @@ def reverse(
     try:
         datetime.date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:8]))
     except ValueError:
-        raise ExitError(f"invalid date in version: {version_str}") from None
+        msg = f"invalid date in version: {version_str}"
+        raise ExitError(msg) from None
 
     _, branch_hash = detect_branch(dir=dir, override=branch_override)
 
@@ -167,7 +172,8 @@ def reverse(
                 break
 
     if n > len(candidates):
-        raise ExitError(f"version not found: {version_str}")
+        msg = f"version not found: {version_str}"
+        raise ExitError(msg)
 
     # N=1 is oldest on that date; candidates are newest-first.
     target_hash = candidates[-n]

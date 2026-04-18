@@ -21,7 +21,8 @@ def detect_branch(
             if hash_ is not None:
                 name = override.rsplit("/", 1)[-1]
                 return name, hash_
-        raise ExitError(f"branch not found: {override}")
+        msg = f"branch not found: {override}"
+        raise ExitError(msg)
 
     target = _git.symbolic_ref("refs/remotes/origin/HEAD", dir=dir)
     if target:
@@ -40,7 +41,8 @@ def detect_branch(
         if hash_ is not None:
             return name, hash_
 
-    raise ExitError("cannot determine default branch")
+    msg = "cannot determine default branch"
+    raise ExitError(msg)
 
 
 def is_on_branch(
