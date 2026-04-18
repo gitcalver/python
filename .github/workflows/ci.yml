@@ -54,13 +54,13 @@ jobs:
           name: python-package-distributions
           path: dist/
 
-  publish-to-testpypi:
-    name: Publish to TestPyPI
+  publish-to-pypi:
+    name: Publish to PyPI
     needs: build
     runs-on: ubuntu-24.04
     environment:
-      name: testpypi
-      url: https://test.pypi.org/p/gitcalver
+      name: pypi
+      url: https://pypi.org/p/gitcalver
     permissions:
       id-token: write
     steps:
@@ -69,5 +69,3 @@ jobs:
           name: python-package-distributions
           path: dist/
       - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
