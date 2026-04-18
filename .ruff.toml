@@ -22,10 +22,12 @@ ignore = [
   "A002",    # shadowing builtins (dir, format) -- intentional API design
   "COM812",  # trailing comma -- conflicts with formatter
   "FBT",     # boolean arguments -- acceptable for internal functions
-  "PLC0415", # import not at top level -- intentional for lazy/circular imports
 ]
 
 [lint.per-file-ignores]
+"src/gitcalver/_hatch_hooks.py" = [
+  "PLC0415", # import not at top level -- lazy import for plugin registration
+]
 "src/gitcalver/cli.py" = [
   "T201",     # print() -- CLI entry point
 ]
