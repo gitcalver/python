@@ -32,9 +32,7 @@ class GitRepo:
             raise RuntimeError(msg)
         return result.stdout.strip()
 
-    def commit_at(
-        self, date_str: str, *, committer_date: str | None = None
-    ) -> str:
+    def commit_at(self, date_str: str, *, committer_date: str | None = None) -> str:
         env = {
             **self._env,
             "GIT_AUTHOR_DATE": date_str,

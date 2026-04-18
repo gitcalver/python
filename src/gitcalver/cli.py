@@ -50,7 +50,7 @@ class Args:
 
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:
-        raise ExitError(1, message)
+        raise ExitError(message)
 
 
 class _NonEmptyStrAction(argparse.Action):

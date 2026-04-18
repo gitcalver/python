@@ -7,7 +7,7 @@ EXIT_WRONG_BRANCH = 3
 
 
 class ExitError(Exception):
-    def __init__(self, code: int, message: str) -> None:
+    def __init__(self, message: str, code: int = EXIT_ERROR) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
