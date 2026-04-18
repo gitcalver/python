@@ -7,7 +7,7 @@ import re
 
 from gitcalver import _git
 from gitcalver._branch import detect_branch, is_on_branch
-from gitcalver._errors import EXIT_DIRTY, EXIT_ERROR, EXIT_WRONG_BRANCH, ExitError
+from gitcalver._errors import EXIT_DIRTY, EXIT_WRONG_BRANCH, ExitError
 from gitcalver._format import Format, format_version
 
 VERSION_RE = re.compile(r"^(\d{8})\.([1-9]\d*)$")
@@ -19,7 +19,6 @@ def is_version_string(s: str) -> bool:
 
 def _date_went_backwards(older: str, newer: str) -> ExitError:
     return ExitError(
-        EXIT_ERROR,
         f"committer date not monotonic: "
         f"older commit dated {older} has a later date than "
         f"newer commit dated {newer}",
@@ -30,21 +29,20 @@ def _validate_repo(dir: str | None) -> None:
     try:
         is_repo = _git.is_git_repo(dir=dir)
     except _git.GitError as e:
-        raise ExitError(EXIT_ERROR, str(e)) from e
+        raise ExitError(str(e)) from e
     if not is_repo:
-        raise ExitError(EXIT_ERROR, "not a git repository")
+        raise ExitError("not a git repository")
     try:
         shallow = _git.is_shallow(dir=dir)
     except _git.GitError as e:
-        raise ExitError(EXIT_ERROR, f"cannot determine repository state: {e}") from e
+        raise ExitError(f"cannot determine repository state: {e}") from e
     if shallow:
         raise ExitError(
-            EXIT_ERROR,
             "shallow clone detected; full history is required"
             " (use git fetch --unshallow)",
         )
     if not _git.has_commits(dir=dir):
-        raise ExitError(EXIT_ERROR, "no commits in repository")
+        raise ExitError("no commits in repository")
 
 
 def forward(
@@ -66,7 +64,7 @@ def forward(
             if is_head
             else f"not a gitcalver version or git revision: {revision}"
         )
-        raise ExitError(EXIT_ERROR, msg) from None
+        raise ExitError(msg) from None
 
     branch_name, branch_hash = detect_branch(dir=dir, override=branch_override)
 
@@ -76,14 +74,14 @@ def forward(
     if not is_on_branch(target_hash, branch_hash, dir=dir):
         if not is_head:
             raise ExitError(
-                EXIT_WRONG_BRANCH,
                 f"{revision} is not on the default branch ({branch_name})",
+                EXIT_WRONG_BRANCH,
             )
         mb = _git.merge_base(target_hash, branch_hash, dir=dir)
         if mb is None:
             raise ExitError(
-                EXIT_WRONG_BRANCH,
                 f"HEAD is not traceable to the default branch ({branch_name})",
+                EXIT_WRONG_BRANCH,
             )
         off_branch = True
         version_rev = mb
@@ -98,7 +96,7 @@ def forward(
                 )
             else:
                 msg = "workspace is dirty; use --dirty to allow"
-            raise ExitError(EXIT_DIRTY, msg)
+            raise ExitError(msg, EXIT_DIRTY)
         dirty = True
 
     date, count = walk_first_parent(dir=dir, rev=version_rev)
@@ -114,7 +112,7 @@ def walk_first_parent(*, dir: str | None, rev: str) -> tuple[str, int]:
     with contextlib.closing(_git.first_parent_log(rev, dir=dir)) as entries:
         first = next(entries, None)
         if first is None:
-            raise ExitError(EXIT_ERROR, "no commits found")
+            raise ExitError("no commits found")
         date = first[1]
         count = 1
 
@@ -142,10 +140,7 @@ def reverse(
 
     match = VERSION_RE.match(version_str)
     if not match:
-        raise ExitError(
-            EXIT_ERROR,
-            f"not a gitcalver version or git revision: {version_str}",
-        )
+        raise ExitError(f"not a gitcalver version or git revision: {version_str}")
 
     date_str = match.group(1)
     n = int(match.group(2))
@@ -153,10 +148,7 @@ def reverse(
     try:
         datetime.date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:8]))
     except ValueError:
-        raise ExitError(
-            EXIT_ERROR,
-            f"invalid date in version: {version_str}",
-        ) from None
+        raise ExitError(f"invalid date in version: {version_str}") from None
 
     _, branch_hash = detect_branch(dir=dir, override=branch_override)
 
@@ -175,7 +167,7 @@ def reverse(
                 break
 
     if n > len(candidates):
-        raise ExitError(EXIT_ERROR, f"version not found: {version_str}")
+        raise ExitError(f"version not found: {version_str}")
 
     # N=1 is oldest on that date; candidates are newest-first.
     target_hash = candidates[-n]

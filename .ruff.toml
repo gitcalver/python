@@ -22,8 +22,10 @@ ignore = [
   "RUF003",  # ambiguous Unicode character in comment
   "A002",    # shadowing builtins (dir, format) -- intentional API design
   "COM812",  # trailing comma -- conflicts with formatter
+  "EM",      # exception messages -- ExitError uses inline messages by design
   "FBT",     # boolean arguments -- acceptable for internal functions
   "PLC0415", # import not at top level -- intentional for lazy/circular imports
+  "TRY003",  # long exception messages -- same as EM
 ]
 
 [lint.per-file-ignores]
