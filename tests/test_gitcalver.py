@@ -23,9 +23,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-def run_cmd(
-    repo: GitRepo, *extra_args: str, branch: str = "main"
-) -> tuple[str, int]:
+def run_cmd(repo: GitRepo, *extra_args: str, branch: str = "main") -> tuple[str, int]:
     args = ["--branch", branch, *extra_args] if branch else [*extra_args]
     return run(args, dir=repo.dir)
 
@@ -99,18 +97,14 @@ def test_dirty_exits_2(git_repo: GitRepo) -> None:
 @pytest.mark.parametrize(
     ("extra_args", "want_exact", "want_prefix"),
     [
-        pytest.param(
-            ["--dirty", "-dirty"], None, "20260410.1-dirty.", id="default"
-        ),
+        pytest.param(["--dirty", "-dirty"], None, "20260410.1-dirty.", id="default"),
         pytest.param(
             ["--prefix", "0.", "--dirty", "-dirty"],
             None,
             "0.20260410.1-dirty.",
             id="semver",
         ),
-        pytest.param(
-            ["--dirty", "+dirty"], None, "20260410.1+dirty.", id="pep440"
-        ),
+        pytest.param(["--dirty", "+dirty"], None, "20260410.1+dirty.", id="pep440"),
         pytest.param(
             ["--prefix", "v0.", "--dirty", "-dirty"],
             None,
@@ -132,9 +126,7 @@ def test_dirty_exits_2(git_repo: GitRepo) -> None:
         pytest.param(
             ["--dirty", ".pre.dirty"], None, "20260410.1.pre.dirty.", id="ruby"
         ),
-        pytest.param(
-            ["--dirty", "+dirty"], None, "20260410.1+dirty.", id="debian"
-        ),
+        pytest.param(["--dirty", "+dirty"], None, "20260410.1+dirty.", id="debian"),
     ],
 )
 def test_dirty(
@@ -234,9 +226,7 @@ def test_empty_repo(tmp_path: Path) -> None:
     assert code == 1
 
 
-def test_git_not_on_path(
-    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_git_not_on_path(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> None:
     git_repo.commit_at("2026-04-10T09:00:00Z")
     monkeypatch.setenv("PATH", "/nonexistent")
     out, code = run_cmd(git_repo)

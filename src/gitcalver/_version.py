@@ -36,9 +36,7 @@ def _validate_repo(dir: str | None) -> None:
     try:
         shallow = _git.is_shallow(dir=dir)
     except _git.GitError as e:
-        raise ExitError(
-            EXIT_ERROR, f"cannot determine repository state: {e}"
-        ) from e
+        raise ExitError(EXIT_ERROR, f"cannot determine repository state: {e}") from e
     if shallow:
         raise ExitError(
             EXIT_ERROR,
