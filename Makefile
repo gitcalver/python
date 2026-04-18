@@ -1,4 +1,4 @@
-.PHONY: sync test lint fmt typecheck
+.PHONY: sync test lint fmt
 
 sync:
 	uv sync --frozen
@@ -9,9 +9,7 @@ test: sync
 lint: sync
 	uv run ruff check
 	uv run ruff format --check
+	uv run ty check
 
 fmt: sync
 	uv run ruff format
-
-typecheck: sync
-	uv run ty check
