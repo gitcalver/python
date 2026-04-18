@@ -8,6 +8,24 @@ description = "Deterministic calendar versioning from git history"
 # Support all non-EOL Python versions.
 requires-python = ">=3.10"
 license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+authors = [
+    {name = "Michael Shields", email = "shields@gitcalver.org"},
+]
+keywords = ["versioning", "calver", "git", "calendar-versioning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+
+[project.urls]
+Homepage = "https://gitcalver.org"
+Source = "https://github.com/gitcalver/python"
+Issues = "https://github.com/gitcalver/python/issues"
 
 [project.scripts]
 gitcalver = "gitcalver.cli:main"
