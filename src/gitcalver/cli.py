@@ -22,7 +22,8 @@ Options:
   --no-dirty          Refuse dirty workspace (overrides --dirty)
   --no-dirty-hash     Suppress .HASH in dirty suffix (requires --dirty)
   --branch BRANCH     Override default branch detection
-  --short             Output short commit hash (reverse mode only)
+  --remote REMOTE     Remote used for cached branch detection (default: origin)
+  --short             Output first seven object-ID characters (reverse mode)
   --version           Show version and exit
   --help              Show this help
 """
@@ -44,6 +45,7 @@ class Args:
     no_dirty: bool = False
     no_dirty_hash: bool = False
     branch: str | None = None
+    remote: str = "origin"
     short: bool = False
     positional: str | None = None
 
@@ -69,7 +71,7 @@ class _NonEmptyStrAction(argparse.Action):
 # Options that take a string value; used by `_normalize_argv` to rewrite the
 # space-separated form to `--opt=value` so argparse accepts values starting
 # with `-`. Keep in sync with the non-boolean options declared in `_parse_args`.
-_OPTS_TAKING_VALUE = frozenset({"--prefix", "--dirty", "--branch"})
+_OPTS_TAKING_VALUE = frozenset({"--prefix", "--dirty", "--branch", "--remote"})
 
 
 def _normalize_argv(argv: list[str]) -> list[str]:
@@ -105,6 +107,7 @@ def _parse_args(argv: list[str]) -> Args:
     parser.add_argument("--no-dirty", action="store_true")
     parser.add_argument("--no-dirty-hash", action="store_true")
     parser.add_argument("--branch", default=None)
+    parser.add_argument("--remote", action=_NonEmptyStrAction, default="origin")
     parser.add_argument("--short", action="store_true")
     parser.add_argument("positional", nargs="?", default=None)
 
@@ -112,6 +115,10 @@ def _parse_args(argv: list[str]) -> Args:
 
     if args.no_dirty_hash and not args.dirty:
         parser.error("--no-dirty-hash requires --dirty")
+    if "\n" in args.prefix or "\r" in args.prefix:
+        parser.error("--prefix must not contain a newline")
+    if "\n" in args.dirty or "\r" in args.dirty:
+        parser.error("--dirty must not contain a newline")
 
     return args
 
@@ -135,7 +142,10 @@ def run(argv: list[str], *, dir: str | None = None) -> tuple[str, int]:
         return USAGE.rstrip("\n"), 0
 
     if args.version:
-        return f"gitcalver {_package_version()}", 0
+        version = _package_version()
+        if not is_version_string(version):
+            version = "(development)"
+        return f"gitcalver {version}", 0
 
     lookup: str | None = None
     # Require the prefix to match before reverse-lookup; avoids treating a
@@ -144,6 +154,18 @@ def run(argv: list[str], *, dir: str | None = None) -> tuple[str, int]:
         candidate = args.positional.removeprefix(args.prefix)
         if is_version_string(candidate):
             lookup = candidate
+
+    if (
+        lookup is None
+        and args.prefix
+        and args.positional is not None
+        and is_version_string(args.positional)
+    ):
+        return (
+            f"gitcalver: version {args.positional} is missing required prefix "
+            f'"{args.prefix}"',
+            1,
+        )
 
     if args.short and lookup is None:
         return "gitcalver: --short is only valid in reverse lookup mode", 1
@@ -155,6 +177,7 @@ def run(argv: list[str], *, dir: str | None = None) -> tuple[str, int]:
                 version_str=lookup,
                 branch_override=args.branch,
                 short=args.short,
+                remote=args.remote,
             )
         else:
             fmt = _build_format(args)
@@ -163,6 +186,7 @@ def run(argv: list[str], *, dir: str | None = None) -> tuple[str, int]:
                 revision=args.positional,
                 fmt=fmt,
                 branch_override=args.branch,
+                remote=args.remote,
             )
     except ExitError as e:
         return f"gitcalver: {e.message}", e.code

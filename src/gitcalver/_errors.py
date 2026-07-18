@@ -4,6 +4,7 @@
 EXIT_ERROR = 1
 EXIT_DIRTY = 2
 EXIT_WRONG_BRANCH = 3
+EXIT_INCOMPLETE_HISTORY = 4
 
 
 class ExitError(Exception):
@@ -11,3 +12,10 @@ class ExitError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class IncompleteHistoryError(ExitError):
+    """The locally available history cannot prove a calculation."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, EXIT_INCOMPLETE_HISTORY)

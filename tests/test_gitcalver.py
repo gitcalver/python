@@ -11,7 +11,7 @@ import pytest
 
 import gitcalver
 from gitcalver._branch import detect_branch
-from gitcalver._errors import ExitError
+from gitcalver._errors import ExitError, IncompleteHistoryError
 from gitcalver._hatch_hooks import hatch_register_version_source
 from gitcalver._hatch_source import GitCalverSource
 from gitcalver._version import reverse, walk_first_parent
@@ -362,7 +362,7 @@ def test_reverse_requires_prefix(git_repo: GitRepo) -> None:
     git_repo.commit_at("2026-04-10T09:00:00Z")
     out, code = run_cmd(git_repo, "--prefix", "v0.", "20260410.1")
     assert code == 1
-    assert "not a gitcalver version or git revision" in out
+    assert "missing required prefix" in out
 
 
 def test_reverse_short(git_repo: GitRepo) -> None:
@@ -370,8 +370,7 @@ def test_reverse_short(git_repo: GitRepo) -> None:
     head = git_repo.head_hash()
     out, code = run_cmd(git_repo, "--short", "20260410.1")
     assert code == 0
-    assert head.startswith(out)
-    assert len(out) == 7
+    assert out == head[:7]
 
 
 def test_reverse_short_ignores_core_abbrev(git_repo: GitRepo) -> None:
@@ -389,7 +388,7 @@ def test_dirty_hash_ignores_core_abbrev(git_repo: GitRepo) -> None:
     out, code = run_cmd(git_repo, "--dirty", "-dirty")
     assert code == 0
     hash_part = out.rsplit(".", 1)[1]
-    assert len(hash_part) == 7
+    assert hash_part == git_repo.head_hash()[:7]
 
 
 def test_reverse_not_found(git_repo: GitRepo) -> None:
@@ -478,8 +477,9 @@ def test_specific_revision_not_on_branch(git_repo: GitRepo) -> None:
     git_repo.commit_at("2026-04-10T10:00:00Z")
     feature_hash = git_repo.head_hash()
     git_repo.checkout("main")
-    _out, code = run_cmd(git_repo, feature_hash)
-    assert code == 3
+    out, code = run_cmd(git_repo, feature_hash)
+    assert code == 2
+    assert feature_hash in out
 
 
 def test_forward_invalid_revision(git_repo: GitRepo) -> None:
@@ -764,6 +764,16 @@ def test_get_version(git_repo: GitRepo) -> None:
     assert v == "20260410.1"
 
 
+def test_get_version_rejects_dirty_newline(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    with pytest.raises(ExitError, match="dirty suffix must not contain a newline"):
+        gitcalver.get_version(
+            repo=git_repo.dir,
+            branch="main",
+            dirty="-dirty\nextra",
+        )
+
+
 def test_find_commit(git_repo: GitRepo) -> None:
     git_repo.commit_at("2026-04-10T09:00:00Z")
     head = git_repo.head_hash()
@@ -778,6 +788,33 @@ def test_find_commit_with_prefix(git_repo: GitRepo) -> None:
     assert v == "v0.20260410.1"
     h = gitcalver.find_commit(v, prefix="v0.", repo=git_repo.dir, branch="main")
     assert h == head
+
+
+def test_public_api_remote(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    head = git_repo.head_hash()
+    git_repo.git("update-ref", "refs/remotes/upstream/trunk", head)
+    git_repo.git(
+        "symbolic-ref",
+        "refs/remotes/upstream/HEAD",
+        "refs/remotes/upstream/trunk",
+    )
+    version = gitcalver.get_version(repo=git_repo.dir, remote="upstream")
+    assert version == "20260410.1"
+    assert (
+        gitcalver.find_commit(
+            version, repo=git_repo.dir, branch="trunk", remote="upstream"
+        )
+        == head
+    )
+
+
+def test_find_commit_requires_prefix(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    with pytest.raises(ExitError, match="missing required prefix"):
+        gitcalver.find_commit(
+            "20260410.1", prefix="v0.", repo=git_repo.dir, branch="main"
+        )
 
 
 # --- python -m gitcalver ---
@@ -885,6 +922,11 @@ def test_cli_dirty_empty_string() -> None:
         _parse_args(["--dirty", ""])
 
 
+def test_cli_dirty_newline() -> None:
+    with pytest.raises(ExitError, match="--dirty must not contain a newline"):
+        _parse_args(["--dirty", "-dirty\nextra"])
+
+
 def test_cli_no_dirty_hash_without_dirty() -> None:
     with pytest.raises(ExitError, match="--no-dirty-hash requires --dirty"):
         _parse_args(["--no-dirty-hash"])
@@ -900,6 +942,16 @@ def test_cli_no_dirty_overrides_dirty(git_repo: GitRepo) -> None:
 def test_cli_branch_missing() -> None:
     with pytest.raises(ExitError, match="--branch"):
         _parse_args(["--branch"])
+
+
+def test_cli_remote_missing() -> None:
+    with pytest.raises(ExitError, match="--remote"):
+        _parse_args(["--remote"])
+
+
+def test_cli_remote_empty() -> None:
+    with pytest.raises(ExitError, match="--remote requires a non-empty string"):
+        _parse_args(["--remote", ""])
 
 
 def test_cli_unknown_option() -> None:
@@ -922,6 +974,8 @@ def test_cli_all_flags() -> None:
             "--no-dirty-hash",
             "--branch",
             "develop",
+            "--remote",
+            "upstream",
             "--short",
             "abc123",
         ]
@@ -930,6 +984,7 @@ def test_cli_all_flags() -> None:
     assert opts.dirty == "-dirty"
     assert opts.no_dirty_hash is True
     assert opts.branch == "develop"
+    assert opts.remote == "upstream"
     assert opts.short is True
     assert opts.positional == "abc123"
 
@@ -1025,10 +1080,10 @@ def test_cli_short_in_forward_mode(git_repo: GitRepo) -> None:
     assert "reverse lookup" in out
 
 
-# --- Shallow clone rejected ---
+# --- Incomplete-history proofs ---
 
 
-def test_shallow_clone_rejected(tmp_path: Path) -> None:
+def test_shallow_clone_inside_date_block_is_incomplete(tmp_path: Path) -> None:
     origin_dir = str(tmp_path / "origin")
     subprocess.run(
         ["git", "init", "-b", "main", origin_dir],
@@ -1047,8 +1102,35 @@ def test_shallow_clone_rejected(tmp_path: Path) -> None:
     )
     clone = GitRepo(dir=clone_dir)
     out, code = run_cmd(clone)
-    assert code == 1
-    assert "shallow clone" in out
+    assert code == 4
+    assert "local history ended" in out
+
+    with pytest.raises(IncompleteHistoryError) as exc_info:
+        gitcalver.get_version(repo=clone.dir, branch="main")
+    assert exc_info.value.code == gitcalver.EXIT_INCOMPLETE_HISTORY
+
+
+def test_shallow_clone_with_older_date_boundary_succeeds(tmp_path: Path) -> None:
+    origin_dir = str(tmp_path / "origin")
+    subprocess.run(
+        ["git", "init", "-b", "main", origin_dir],
+        capture_output=True,
+        check=True,
+    )
+    origin = GitRepo(dir=origin_dir)
+    origin.commit_at("2026-04-09T09:00:00Z")
+    origin.commit_at("2026-04-10T10:00:00Z")
+
+    clone_dir = str(tmp_path / "clone")
+    subprocess.run(
+        ["git", "clone", "--depth", "2", f"file://{origin_dir}", clone_dir],
+        capture_output=True,
+        check=True,
+    )
+    clone = GitRepo(dir=clone_dir)
+    out, code = run_cmd(clone)
+    assert code == 0
+    assert out == "20260410.1"
 
 
 # --- Partial clone accepted ---

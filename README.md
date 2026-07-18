@@ -84,7 +84,8 @@ reverse lookup. Dirty versions cannot be reversed.
 | `--no-dirty`        | Refuse dirty versions (overrides `--dirty`)    |
 | `--no-dirty-hash`   | Suppress `.HASH` suffix (requires `--dirty`)   |
 | `--branch BRANCH`   | Base branch name; overrides auto-detection. This is the branch versions are minted on, not the branch you are working on. |
-| `--short`           | Output short commit hash (reverse lookup mode) |
+| `--remote REMOTE`   | Remote used for cached branch detection (default: `origin`); never fetches |
+| `--short`           | Output first seven object-ID characters (reverse lookup mode) |
 | `--help`            | Show help                                      |
 
 ### Exit codes
@@ -92,9 +93,10 @@ reverse lookup. Dirty versions cannot be reversed.
 | Code | Meaning                                |
 |------|----------------------------------------|
 | 0    | Success                                |
-| 1    | Error (not a git repo, no commits, non-monotonic dates, shallow clone) |
+| 1    | Error (not a git repo, no commits, non-monotonic dates, etc.) |
 | 2    | Dirty workspace or off default branch (without `--dirty`) |
 | 3    | Cannot trace to default branch         |
+| 4    | Local history is insufficient to prove the result |
 
 ## Python API
 
@@ -110,6 +112,7 @@ version = gitcalver.get_version(
     revision="HEAD~1",
     prefix="v0.",
     dirty="-dirty",
+    remote="upstream",
 )
 
 # Reverse: resolve a version back to a commit hash.
@@ -122,7 +125,8 @@ commit = gitcalver.find_commit(
 ```
 
 Errors are raised as `gitcalver.ExitError`, which carries a `code` attribute
-matching the CLI exit codes above.
+matching the CLI exit codes above. Insufficient local history raises the typed
+`gitcalver.IncompleteHistoryError` subclass.
 
 ## Hatch plugin
 
@@ -141,14 +145,17 @@ source = "gitcalver"
 # dirty = "-dirty"
 # no-dirty-hash = true
 # branch = "main"
+# remote = "origin"
 ```
 
 ## Requirements
 
 - Python 3.10+
 - `git` on `$PATH`
-- Full commit history (shallow clones made with `--depth` are rejected; partial
-  clones made with `--filter=blob:none` are fine)
+- Enough local commit history to prove the calculation. Shallow and partial
+  clones work when the selected-chain relationship, anchor, and complete
+  relevant UTC date block are available. GitCalVer never fetches missing
+  history during a calculation.
 
 ## License
 

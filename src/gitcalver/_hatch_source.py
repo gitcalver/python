@@ -20,6 +20,7 @@ class GitCalverSource(VersionSourceInterface):
                 dirty=str(config.get("dirty", "")),
                 dirty_hash=not config.get("no-dirty-hash", False),
                 branch=config.get("branch") or None,
+                remote=str(config.get("remote", "origin")),
                 repo=self.root,
             )
         except ExitError as e:

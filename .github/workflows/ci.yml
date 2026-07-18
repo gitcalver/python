@@ -35,9 +35,26 @@ jobs:
       - run: uv python install 3.14
       - run: make lint
 
+  conformance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: gitcalver/sh
+          ref: c89d24c9ac36f0672ecfff9727532e344bfa9af9
+          path: conformance-sh
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+      - run: uv python install 3.14
+      - run: make test-conformance CONFORMANCE_DIR=conformance-sh
+
   build:
     name: Build distribution
-    needs: [test, lint]
+    needs: [test, lint, conformance]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     steps:

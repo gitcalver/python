@@ -4,19 +4,31 @@
 import os
 import subprocess
 from collections.abc import Generator
+from pathlib import Path
 
 
 class GitError(Exception):
     pass
 
 
-_SHORT_HASH_LEN = 7
+_HASH_PREFIX_LEN = 7
 
 
 def _os_error_message(e: OSError) -> str:
     if e.filename == "git":
         return "git not found on PATH"
     return str(e)
+
+
+def _env(*, utc: bool = False) -> dict[str, str]:
+    env = {
+        **os.environ,
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+    }
+    if utc:
+        env["TZ"] = "UTC"
+    return env
 
 
 def _run(*args: str, dir: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -26,6 +38,7 @@ def _run(*args: str, dir: str | None = None) -> subprocess.CompletedProcess[str]
             capture_output=True,
             text=True,
             cwd=dir,
+            env=_env(),
             check=False,
         )
     except OSError as e:
@@ -44,20 +57,21 @@ def git_ok(*args: str, dir: str | None = None) -> bool:
 
 
 def rev_parse(rev: str, dir: str | None = None) -> str:
-    return git("rev-parse", rev, dir=dir)
+    return git("rev-parse", "--verify", rev, dir=dir)
 
 
-def rev_parse_short(rev: str, dir: str | None = None) -> str:
-    # Pin the minimum length so output doesn't vary with core.abbrev.
-    return git("rev-parse", f"--short={_SHORT_HASH_LEN}", rev, dir=dir)
+def object_id_prefix(rev: str, dir: str | None = None) -> str:
+    """Return the contract-defined, fixed-width object-ID prefix.
+
+    This is a version component, not an unambiguous Git revision. GitCalVer
+    requires exactly the first seven lowercase object-ID characters even when
+    Git's repository-dependent abbreviation would be longer.
+    """
+    return rev_parse(rev, dir=dir)[:_HASH_PREFIX_LEN].lower()
 
 
 def is_git_repo(dir: str | None = None) -> bool:
     return git_ok("rev-parse", "--git-dir", dir=dir)
-
-
-def is_shallow(dir: str | None = None) -> bool:
-    return git("rev-parse", "--is-shallow-repository", dir=dir) == "true"
 
 
 def has_commits(dir: str | None = None) -> bool:
@@ -65,10 +79,19 @@ def has_commits(dir: str | None = None) -> bool:
 
 
 def is_dirty(dir: str | None = None) -> bool:
-    try:
-        return git("status", "--porcelain", dir=dir) != ""
-    except GitError:
-        return False
+    return git("status", "--porcelain", dir=dir) != ""
+
+
+def is_bare(dir: str | None = None) -> bool:
+    return git("rev-parse", "--is-bare-repository", dir=dir) == "true"
+
+
+def common_dir(dir: str | None = None) -> Path:
+    value = git("rev-parse", "--git-common-dir", dir=dir)
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return (Path(dir) if dir is not None else Path.cwd()).joinpath(path).resolve()
 
 
 def symbolic_ref(ref: str, dir: str | None = None) -> str | None:
@@ -85,21 +108,44 @@ def try_ref_hash(ref: str, dir: str | None = None) -> str | None:
         return None
 
 
-def is_ancestor(commit: str, ancestor_of: str, dir: str | None = None) -> bool:
-    return git_ok("merge-base", "--is-ancestor", commit, ancestor_of, dir=dir)
+def ancestor_status(commit: str, ancestor_of: str, dir: str | None = None) -> int:
+    return _run("merge-base", "--is-ancestor", commit, ancestor_of, dir=dir).returncode
 
 
-def merge_base(rev1: str, rev2: str, dir: str | None = None) -> str | None:
+def object_exists(object_spec: str, dir: str | None = None) -> bool:
+    return git_ok("cat-file", "-e", object_spec, dir=dir)
+
+
+def stored_first_parent(commit: str, dir: str | None = None) -> str | None:
+    data = git("cat-file", "commit", commit, dir=dir)
+    for line in data.splitlines():
+        if not line:
+            break
+        if line.startswith("parent "):
+            return line.removeprefix("parent ")
+    return None
+
+
+def rev_list_is_complete(rev: str, dir: str | None = None) -> None:
     try:
-        return git("merge-base", rev1, rev2, dir=dir)
-    except GitError:
-        return None
+        result = subprocess.run(
+            ["git", "rev-list", rev],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=dir,
+            env=_env(),
+            check=False,
+        )
+    except OSError as e:
+        raise GitError(_os_error_message(e)) from e
+    if result.returncode != 0:
+        raise GitError(result.stderr.strip() or f"git rev-list {rev} failed")
 
 
 def first_parent_log(
     rev: str, dir: str | None = None
 ) -> Generator[tuple[str, str], None, None]:
-    env = {**os.environ, "TZ": "UTC"}
     try:
         proc = subprocess.Popen(
             [
@@ -114,7 +160,7 @@ def first_parent_log(
             stderr=subprocess.DEVNULL,
             text=True,
             cwd=dir,
-            env=env,
+            env=_env(utc=True),
         )
     except OSError as e:
         raise GitError(_os_error_message(e)) from e
@@ -125,6 +171,7 @@ def first_parent_log(
             hash_, _, date = line.strip().partition(" ")
             if date:
                 yield hash_, date
-        if proc.wait() != 0:
+        returncode = proc.wait()
+        if returncode != 0:
             msg = f"git log {rev} failed"
             raise GitError(msg)
