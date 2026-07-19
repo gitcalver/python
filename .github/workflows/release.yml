@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+concurrency: release
+
+permissions: {}
+
+jobs:
+  tag:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: gitcalver/sh@a7f5c0600057d05028467cda8c65b36d5aa1eaf5 # v20260719.1
+        id: version
+        with:
+          tag-prefix: v
+          tag: 'true'
+
+  publish:
+    name: Publish to PyPI
+    needs: tag
+    runs-on: ubuntu-24.04
+    environment:
+      # PyPI's trusted publisher is bound to this workflow file and environment.
+      name: pypi
+      url: https://pypi.org/p/gitcalver
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.tag.outputs.tag }}
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+      - run: uv python install 3.14
+      - run: uv build
+      - name: Verify distribution filenames
+        env:
+          VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          [[ -f "dist/gitcalver-$VERSION-py3-none-any.whl" ]]
+          [[ -f "dist/gitcalver-$VERSION.tar.gz" ]]
+          [[ $(find dist -maxdepth 1 -type f | wc -l) -eq 2 ]]
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          skip-existing: true

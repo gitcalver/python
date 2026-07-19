@@ -55,7 +55,6 @@ jobs:
   build:
     name: Build distribution
     needs: [test, lint, conformance]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -65,24 +64,14 @@ jobs:
         with:
           enable-cache: true
       - run: uv python install 3.14
+      - uses: gitcalver/sh@a7f5c0600057d05028467cda8c65b36d5aa1eaf5 # v20260719.1
+        id: version
+        with:
+          dirty: +dirty
+      - name: Verify Python calculation
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          actual=$(uv run python -m gitcalver --dirty +dirty)
+          [[ $actual == "$VERSION" ]]
       - run: uv build
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: python-package-distributions
-          path: dist/
-
-  publish-to-pypi:
-    name: Publish to PyPI
-    needs: build
-    runs-on: ubuntu-24.04
-    environment:
-      name: pypi
-      url: https://pypi.org/p/gitcalver
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: python-package-distributions
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
