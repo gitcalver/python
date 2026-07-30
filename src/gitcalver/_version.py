@@ -4,6 +4,7 @@
 import contextlib
 import datetime
 import re
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -229,7 +230,7 @@ def forward(
             raise ExitError(msg, EXIT_DIRTY)
         dirty = True
 
-    date, count = walk_first_parent(dir=dir, rev=version_rev)
+    date, count = walk_cohort(dir=dir, rev=version_rev)
 
     short_hash = ""
     if dirty and fmt.dirty_hash:
@@ -238,35 +239,111 @@ def forward(
     return format_version(fmt, date, count, dirty, short_hash)
 
 
-def walk_first_parent(*, dir: str | None, rev: str) -> tuple[str, int]:
-    last_hash: str | None = None
+# One entry per object name handed to CommitReader.read: (oid, parents, date).
+_CommitMemo = dict[str, tuple[str, list[str], str]]
+
+
+def _read_commit(
+    reader: _git.CommitReader, rev: str, memo: _CommitMemo
+) -> tuple[str, list[str], str] | None:
+    cached = memo.get(rev)
+    if cached is not None:
+        return cached
     try:
-        with contextlib.closing(_git.first_parent_log(rev, dir=dir)) as entries:
-            first = next(entries, None)
-            if first is None:
-                msg = "no commits found"
-                raise ExitError(msg)
-            last_hash, date = first
-            count = 1
-
-            # Only the first date transition matters: once the date changes,
-            # we're done counting. Monotonicity is only checked within the
-            # target date's run; earlier violations are not surfaced here.
-            for entry_hash, entry_date in entries:
-                last_hash = entry_hash
-                if entry_date != date:
-                    if entry_date > date:
-                        raise _date_went_backwards(entry_date, date)
-                    return date, count
-                count += 1
+        entry = reader.read(rev)
     except _git.GitError as e:
-        msg = "local history ended inside the target date block"
+        msg = "local history ended before the result could be proved"
         raise IncompleteHistoryError(msg) from e
+    if entry is None:
+        return None
+    memo[rev] = entry
+    memo[entry[0]] = entry
+    return entry
 
-    if last_hash is None or _stored_first_parent(last_hash, dir=dir) is not None:
-        msg = f"local history ended inside the {date} date block"
+
+def _shallow_set(dir: str | None) -> frozenset[str]:
+    try:
+        shallow_file = _git.common_dir(dir=dir) / "shallow"
+    except _git.GitError as e:
+        msg = "cannot resolve git common directory"
+        raise ExitError(msg) from e
+    if not shallow_file.is_file():
+        return frozenset()
+    try:
+        lines = shallow_file.read_text().splitlines()
+    except OSError as e:
+        msg = f"cannot read shallow boundary: {e}"
+        raise IncompleteHistoryError(msg) from e
+    return frozenset(line for line in lines if line)
+
+
+def _cohort_count(
+    root: str,
+    date: str,
+    *,
+    reader: _git.CommitReader,
+    memo: _CommitMemo,
+    shallow: frozenset[str],
+) -> int:
+    """Pruned BFS from root: count commits reachable through any parent
+    whose UTC committer date equals `date` (the 0.3 date cohort).
+
+    Same date: counted and traversed. Strictly older: excluded, not
+    traversed -- its own ancestors need no proof, so objects are read on
+    demand and cost stays O(cohort + frontier), and an object missing below
+    the pruned frontier never fails the walk. Strictly newer: the committer
+    date went backwards along an ancestry edge, an error. A same-date
+    commit's parent whose object is absent, or a same-date commit recorded
+    as a shallow boundary with stored parents, leaves the cohort
+    unprovable. The shallow check is deliberate even when the boundary's
+    stored parents happen to be present locally: the reference
+    implementation cannot see past traversal grafts, and every
+    implementation must agree. A true root is a commit with no stored
+    parents (raw objects expose stored parents even at shallow
+    boundaries) -- real clones list depth-cut roots in the shallow file,
+    and those hide nothing.
+    """
+    root_entry = _read_commit(reader, root, memo)
+    if root_entry is None:
+        msg = "local history ended before the result could be proved"
         raise IncompleteHistoryError(msg)
+    root_oid, root_parents, _root_date = root_entry
+    visited = {root_oid}
+    queue = deque([(root_oid, root_parents)])
+    count = 0
+    while queue:
+        node, parents = queue.popleft()
+        count += 1
+        if parents and node in shallow:
+            msg = f"local history ended inside the {date} date block"
+            raise IncompleteHistoryError(msg)
+        for parent in parents:
+            if parent in visited:
+                continue
+            entry = _read_commit(reader, parent, memo)
+            if entry is None:
+                msg = f"local history ended inside the {date} date block"
+                raise IncompleteHistoryError(msg)
+            parent_oid, parent_parents, parent_date = entry
+            if parent_date == date:
+                visited.add(parent_oid)
+                queue.append((parent_oid, parent_parents))
+            elif parent_date > date:
+                raise _date_went_backwards(parent_date, date)
+            # else strictly older: prune, don't count, don't traverse.
+    return count
 
+
+def walk_cohort(*, dir: str | None, rev: str) -> tuple[str, int]:
+    shallow = _shallow_set(dir)
+    with contextlib.closing(_git.CommitReader(dir=dir)) as reader:
+        memo: _CommitMemo = {}
+        entry = _read_commit(reader, rev, memo)
+        if entry is None:
+            msg = "no commits found"
+            raise ExitError(msg)
+        oid, _parents, date = entry
+        count = _cohort_count(oid, date, reader=reader, memo=memo, shallow=shallow)
     return date, count
 
 
@@ -317,7 +394,12 @@ def reverse(
                 elif commit_date < date_str:
                     # Dates are non-increasing (checked above); no earlier matches.
                     return _select_reverse_candidate(
-                        candidates, n=n, version_str=version_str, short=short, dir=dir
+                        candidates,
+                        n=n,
+                        version_str=version_str,
+                        date_str=date_str,
+                        short=short,
+                        dir=dir,
                     )
     except _git.GitError as e:
         msg = "local history ended before version could be proved"
@@ -328,7 +410,12 @@ def reverse(
         raise IncompleteHistoryError(msg)
 
     return _select_reverse_candidate(
-        candidates, n=n, version_str=version_str, short=short, dir=dir
+        candidates,
+        n=n,
+        version_str=version_str,
+        date_str=date_str,
+        short=short,
+        dir=dir,
     )
 
 
@@ -337,16 +424,37 @@ def _select_reverse_candidate(
     *,
     n: int,
     version_str: str,
+    date_str: str,
     short: bool,
     dir: str | None,
 ) -> str:
-
-    if n > len(candidates):
+    if not candidates:
         msg = f"version not found: {version_str}"
         raise ExitError(msg)
 
-    # N=1 is oldest on that date; candidates are newest-first.
-    target_hash = candidates[-n]
+    # candidates is newest-first; a member's cohort count strictly increases
+    # oldest to newest (each newer member's cohort is a strict superset), so
+    # scanning oldest-first and stopping once the count passes n is exact --
+    # a gap can never be filled by a later (larger) member. One reader and
+    # memo serve every member's walk: the memo is pure object data, so
+    # sharing it cannot change any walk's outcome, only avoid re-reads.
+    target_hash: str | None = None
+    shallow = _shallow_set(dir)
+    with contextlib.closing(_git.CommitReader(dir=dir)) as reader:
+        memo: _CommitMemo = {}
+        for candidate in reversed(candidates):
+            count = _cohort_count(
+                candidate, date_str, reader=reader, memo=memo, shallow=shallow
+            )
+            if count == n:
+                target_hash = candidate
+                break
+            if count > n:
+                break
+
+    if target_hash is None:
+        msg = f"version not found: {version_str}"
+        raise ExitError(msg)
 
     if short:
         return _git.object_id_prefix(target_hash, dir=dir)

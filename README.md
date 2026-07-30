@@ -4,7 +4,16 @@ A Python implementation of [GitCalVer](https://gitcalver.org), which derives
 calendar-based version numbers from git history.
 
 Each commit on the default branch gets a unique, strictly increasing version of
-the form `YYYYMMDD.N`, where `N` is the number of commits on that UTC date.
+the form `YYYYMMDD.N`, where `N` is the size of the commit's *date cohort*:
+the commits reachable from it, through any parent, whose UTC committer date
+equals its own. Counting through every parent (not just the first) is what
+keeps versions strictly increasing even across merges that reparent the
+default branch's history.
+
+Because a merge can pull same-date commits in from another branch, N can jump
+by more than one from one default-branch commit to the next; the sequence is
+strictly increasing but not necessarily contiguous. Reverse lookup for a
+skipped value reports "version not found".
 
 See the [GitCalVer specification](https://gitcalver.org) for full details.
 
@@ -154,8 +163,10 @@ source = "gitcalver"
 - `git` on `$PATH`
 - Enough local commit history to prove the calculation. Shallow and partial
   clones work when the selected-chain relationship, anchor, and complete
-  relevant UTC date block are available. GitCalVer never fetches missing
-  history during a calculation.
+  relevant date cohort are available. A shallow boundary behind a
+  strictly-older commit never needs proving, since the cohort walk never
+  traverses past it. GitCalVer never fetches missing history during a
+  calculation.
 
 ## License
 
