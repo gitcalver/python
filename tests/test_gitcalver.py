@@ -14,7 +14,7 @@ from gitcalver._branch import detect_branch
 from gitcalver._errors import ExitError, IncompleteHistoryError
 from gitcalver._hatch_hooks import hatch_register_version_source
 from gitcalver._hatch_source import GitCalverSource
-from gitcalver._version import reverse, walk_first_parent
+from gitcalver._version import reverse, walk_cohort
 from gitcalver.cli import _parse_args, main, run
 
 from _helpers import GitRepo
@@ -283,13 +283,13 @@ def test_decreasing_dates_exits_1(git_repo: GitRepo) -> None:
     assert "newer commit dated 20260410" in out
 
 
-# --- Walk first parent: no commits ---
+# --- Walk cohort: no commits ---
 
 
-def test_walk_first_parent_no_commits(git_repo: GitRepo) -> None:
+def test_walk_cohort_no_commits(git_repo: GitRepo) -> None:
     git_repo.commit_at("2026-04-10T09:00:00Z")
     with pytest.raises(ExitError, match="no commits found"):
-        walk_first_parent(dir=git_repo.dir, rev="HEAD..HEAD")
+        walk_cohort(dir=git_repo.dir, rev="HEAD..HEAD")
 
 
 # --- Empty commits counted ---
@@ -488,23 +488,332 @@ def test_forward_invalid_revision(git_repo: GitRepo) -> None:
     assert code == 1
 
 
-# --- First-parent / merge behavior ---
+# --- Merge behavior (0.3: cohort counts all same-date parents) ---
 
 
-def test_merge_first_parent_only(git_repo: GitRepo) -> None:
-    git_repo.commit_at("2026-04-10T09:00:00Z")
+def test_merge_counts_all_same_date_parents(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")  # A: root
     git_repo.create_branch("feature")
-    git_repo.commit_at("2026-04-10T10:00:00Z")
-    git_repo.commit_at("2026-04-10T11:00:00Z")
+    git_repo.commit_at("2026-04-10T10:00:00Z")  # C1: feature, parent A
+    git_repo.commit_at("2026-04-10T11:00:00Z")  # C2: feature, parent C1
     git_repo.checkout("main")
-    git_repo.commit_at("2026-04-10T12:00:00Z")
-    git_repo.merge("feature", "2026-04-10T13:00:00Z")
+    git_repo.commit_at("2026-04-10T12:00:00Z")  # B: main, parent A
+    git_repo.merge("feature", "2026-04-10T13:00:00Z")  # M: parents B, C2
 
     out, code = run_cmd(git_repo)
     assert code == 0
-    # 3 first-parent commits on main: initial, 12:00, merge.
-    # Feature branch commits are not counted.
+    # Membership is still first-parent-chain-only, but N is the size of M's
+    # date cohort: everything reachable from M through any parent that
+    # shares its UTC date. {M, B, C2, C1, A} = 5; the feature-branch
+    # commits are members of the cohort even though they're not chain
+    # members themselves.
+    assert out == "20260410.5"
+
+
+def test_cross_day_merge_parent_not_counted(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")  # A: root
+    git_repo.create_branch("side")
+    git_repo.commit_at("2026-04-09T09:00:00Z")  # C: side, dated the day before A
+    git_repo.checkout("main")
+    git_repo.commit_at("2026-04-10T10:00:00Z")  # B: main, parent A
+    git_repo.merge("side", "2026-04-10T11:00:00Z")  # M: parents B, C
+
+    out, code = run_cmd(git_repo)
+    assert code == 0
+    # C is strictly older than M's date; it's excluded from the cohort and
+    # never traversed, even though it's a direct merge parent.
     assert out == "20260410.3"
+
+
+def test_root_reached_via_multiple_paths_counted_once(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")  # A: root
+    git_repo.create_branch("feature")
+    git_repo.commit_at("2026-04-10T10:00:00Z")  # P1: feature, parent A
+    git_repo.checkout("main")
+    git_repo.commit_at("2026-04-10T11:00:00Z")  # P2: main, parent A
+    git_repo.merge("feature", "2026-04-10T12:00:00Z")  # M: parents P2, P1
+
+    out, code = run_cmd(git_repo)
+    assert code == 0
+    # A is reachable from M through both P1 and P2; the visited-once BFS
+    # counts it exactly once. {M, P2, P1, A} = 4.
+    assert out == "20260410.4"
+
+
+# --- Incident regression: merge + fast-forward reparenting ---
+
+
+def test_incident_topology_merge_ff_never_decreases(git_repo: GitRepo) -> None:
+    # Reproduces the reparenting incident: main accumulates same-date
+    # commits, a short-lived feature branch merges main in, then main
+    # fast-forwards onto that merge. Main's own commits leave the
+    # first-parent chain, but 0.3's cohort still counts them through the
+    # merge's second parent, so the version never goes backwards.
+    git_repo.commit_at("2026-04-10T09:00:00Z")  # A: root
+    git_repo.create_branch("feature")
+    git_repo.commit_at("2026-04-10T10:00:00Z")  # F1: feature, parent A
+    git_repo.checkout("main")
+    git_repo.commit_at("2026-04-10T11:00:00Z")  # B2: main, parent A
+    git_repo.commit_at("2026-04-10T12:00:00Z")  # B3: main, parent B2
+    git_repo.commit_at("2026-04-10T13:00:00Z")  # B4: main, parent B3
+
+    before_out, before_code = run_cmd(git_repo)
+    assert before_code == 0
+    assert before_out == "20260410.4"
+
+    git_repo.checkout("feature")
+    git_repo.merge("main", "2026-04-10T14:00:00Z")  # M: parents F1, B4
+    git_repo.checkout("main")
+    git_repo.git("merge", "--ff-only", "feature")
+
+    after_out, after_code = run_cmd(git_repo)
+    assert after_code == 0
+    # Cohort of M: {M, F1, B4, A, B3, B2} = 6.
+    assert after_out == "20260410.6"
+
+    # Compare as (date, count) numbers: string comparison would falsely
+    # order "…10" before "…9" exactly when 0.3's sparse jumps matter.
+    def parsed(version: str) -> tuple[int, int]:
+        date_part, _, count_part = version.partition(".")
+        return int(date_part), int(count_part)
+
+    assert parsed(after_out) > parsed(before_out)
+
+
+def test_sparse_reverse_gaps(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")  # A: root
+    git_repo.create_branch("feature")
+    git_repo.commit_at("2026-04-10T10:00:00Z")  # F1: feature, parent A
+    git_repo.checkout("main")
+    git_repo.commit_at("2026-04-10T11:00:00Z")  # B2: main, parent A
+    git_repo.commit_at("2026-04-10T12:00:00Z")  # B3: main, parent B2
+    git_repo.commit_at("2026-04-10T13:00:00Z")  # B4: main, parent B3
+    git_repo.checkout("feature")
+    git_repo.merge("main", "2026-04-10T14:00:00Z")  # M: parents F1, B4
+    git_repo.checkout("main")
+    git_repo.git("merge", "--ff-only", "feature")
+    m_hash = git_repo.head_hash()
+    f1_hash = git_repo.git("rev-parse", "main~1")
+    a_hash = git_repo.git("rev-parse", "main~2")
+
+    # First-parent chain membership is unchanged from 0.2: only M, F1, and A
+    # are candidates for date 2026-04-10. Their cohort sizes are 6, 2, and 1
+    # -- sparse. N=3,4,5 fall in the gap left by main's own commits
+    # (B2-B4), which are reachable only off-chain, through the merge's
+    # second parent.
+    out, code = run_cmd(git_repo, "20260410.1")
+    assert code == 0
+    assert out == a_hash
+
+    out, code = run_cmd(git_repo, "20260410.2")
+    assert code == 0
+    assert out == f1_hash
+
+    out, code = run_cmd(git_repo, "20260410.6")
+    assert code == 0
+    assert out == m_hash
+
+    for n in (3, 4, 5):
+        _, code = run_cmd(git_repo, f"20260410.{n}")
+        assert code == 1
+
+
+# --- Pruned-walk monotonicity: near-cohort vs. buried skew ---
+
+
+def test_near_cohort_future_date_errors(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")  # A: root
+    git_repo.create_branch("feature")
+    git_repo.commit_at("2026-04-11T09:00:00Z")  # F: feature, dated a day later
+    git_repo.checkout("main")
+    git_repo.commit_at("2026-04-10T10:00:00Z")  # B: main, parent A
+    git_repo.merge("feature", "2026-04-10T11:00:00Z")  # M: parents B, F
+
+    out, code = run_cmd(git_repo)
+    assert code == 1
+    assert "committer date not monotonic" in out
+
+
+def test_buried_future_date_tolerated(git_repo: GitRepo) -> None:
+    # A "skewed" ancestor (dated later than its own child) exists deep in
+    # history, but it's buried behind a commit that's strictly older than
+    # the target's cohort date, so the pruned walk never traverses into it
+    # and the skew goes unnoticed -- by design.
+    git_repo.commit_at("2026-04-11T09:00:00Z")  # P: buried root, "future"-dated
+    git_repo.commit_at("2026-04-05T09:00:00Z")  # O: child of P, dated much earlier
+    git_repo.commit_at("2026-04-10T09:00:00Z")  # B: child of O
+    git_repo.commit_at("2026-04-10T10:00:00Z")  # C: child of B (target)
+
+    out, code = run_cmd(git_repo)
+    assert code == 0
+    # Cohort of C (2026-04-10): {C, B} = 2. O is strictly older and pruned
+    # before P's anomalous date is ever examined.
+    assert out == "20260410.2"
+
+
+# --- Shallow boundaries reached through a second (merge) parent ---
+
+
+def test_shallow_boundary_on_second_parent_path_exits_4(tmp_path: Path) -> None:
+    origin_dir = str(tmp_path / "origin")
+    subprocess.run(
+        ["git", "init", "-b", "main", origin_dir],
+        capture_output=True,
+        check=True,
+    )
+    origin = GitRepo(dir=origin_dir)
+    origin.commit_at("2026-04-10T09:00:00Z")  # A: root
+    origin.create_branch("feature")
+    origin.commit_at("2026-04-10T09:30:00Z")  # C1: feature, parent A
+    origin.commit_at("2026-04-10T10:00:00Z")  # C2: feature, parent C1
+    origin.checkout("main")
+    origin.commit_at("2026-04-10T10:30:00Z")  # B: main, parent A
+    origin.merge("feature", "2026-04-10T11:00:00Z")  # M: parents B, C2
+
+    clone_dir = str(tmp_path / "clone")
+    subprocess.run(
+        ["git", "clone", "--depth", "3", f"file://{origin_dir}", clone_dir],
+        capture_output=True,
+        check=True,
+    )
+    clone = GitRepo(dir=clone_dir)
+    out, code = run_cmd(clone)
+    assert code == 4
+    assert "local history ended" in out
+    # The first-parent side (B -> A) is fully resolved down to a genuine
+    # root, so only the second-parent side's shallow cut (C1) is at fault.
+
+
+def test_reverse_shallow_second_parent_exits_4(tmp_path: Path) -> None:
+    # Same topology as the forward test above; reverse lookup shares the
+    # proof obligation through its per-member cohort scan. 20260410.2
+    # resolves at B, whose cohort never reaches the shallow cut, while
+    # 20260410.5 needs the merge's cohort, which does.
+    origin_dir = str(tmp_path / "origin")
+    subprocess.run(
+        ["git", "init", "-b", "main", origin_dir],
+        capture_output=True,
+        check=True,
+    )
+    origin = GitRepo(dir=origin_dir)
+    origin.commit_at("2026-04-10T09:00:00Z")  # A: root
+    origin.create_branch("feature")
+    origin.commit_at("2026-04-10T09:30:00Z")  # C1: feature, parent A
+    origin.commit_at("2026-04-10T10:00:00Z")  # C2: feature, parent C1
+    origin.checkout("main")
+    origin.commit_at("2026-04-10T10:30:00Z")  # B: main, parent A
+    origin.merge("feature", "2026-04-10T11:00:00Z")  # M: parents B, C2
+
+    clone_dir = str(tmp_path / "clone")
+    subprocess.run(
+        ["git", "clone", "--depth", "3", f"file://{origin_dir}", clone_dir],
+        capture_output=True,
+        check=True,
+    )
+    clone = GitRepo(dir=clone_dir)
+
+    out, code = run_cmd(clone, "20260410.2")
+    assert code == 0
+    assert out == clone.git("rev-parse", "HEAD~1")
+
+    _, code = run_cmd(clone, "20260410.5")
+    assert code == 4
+
+
+def test_reverse_rejects_future_date_in_member_cohort(git_repo: GitRepo) -> None:
+    # The requested block member's own cohort walk finds a future-dated
+    # commit through the merge's second parent: a decreasing-history error
+    # surfaced by the cohort machinery, not the block delimiter (the
+    # first-parent chain's dates are perfectly monotonic here).
+    git_repo.commit_at("2026-04-10T09:00:00Z")  # A: root
+    git_repo.create_branch("feature")
+    git_repo.commit_at("2026-04-11T09:00:00Z")  # S1: feature, dated tomorrow
+    git_repo.checkout("main")
+    git_repo.merge("feature", "2026-04-10T10:00:00Z")  # M: parents A, S1
+
+    out, code = run_cmd(git_repo, "20260410.2")
+    assert code == 1
+    assert "not monotonic" in out
+
+
+def test_older_dated_second_parent_boundary_succeeds(tmp_path: Path) -> None:
+    origin_dir = str(tmp_path / "origin")
+    subprocess.run(
+        ["git", "init", "-b", "main", origin_dir],
+        capture_output=True,
+        check=True,
+    )
+    origin = GitRepo(dir=origin_dir)
+    origin.commit_at("2026-04-10T09:00:00Z")  # A: root
+    origin.create_branch("feature")
+    origin.commit_at("2026-04-09T09:00:00Z")  # C1: feature, dated the day before
+    origin.commit_at("2026-04-09T10:00:00Z")  # C2: feature, dated the day before
+    origin.checkout("main")
+    origin.commit_at("2026-04-10T10:00:00Z")  # B: main, parent A
+    origin.merge("feature", "2026-04-10T11:00:00Z")  # M: parents B, C2
+
+    clone_dir = str(tmp_path / "clone")
+    subprocess.run(
+        ["git", "clone", "--depth", "3", f"file://{origin_dir}", clone_dir],
+        capture_output=True,
+        check=True,
+    )
+    clone = GitRepo(dir=clone_dir)
+    out, code = run_cmd(clone)
+    assert code == 0
+    # C2 is strictly older than M's date and pruned before traversal; its
+    # own shallow-cut ancestor (C1) never needs to be proved complete.
+    assert out == "20260410.3"
+
+
+# --- Off-branch anchor uses the cohort count of the anchor, not the target ---
+
+
+def test_off_branch_anchor_uses_cohort_count(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")  # A: root
+    git_repo.create_branch("feature2")
+    git_repo.commit_at("2026-04-10T10:00:00Z")  # C: feature2, parent A
+    git_repo.checkout("main")
+    git_repo.commit_at("2026-04-10T11:00:00Z")  # B: main, parent A
+    git_repo.merge("feature2", "2026-04-10T12:00:00Z")  # M: parents B, C
+    git_repo.create_branch("feature3")
+    git_repo.commit_at("2026-04-10T13:00:00Z")  # D: feature3, parent M
+
+    out, code = run_cmd(git_repo, "--dirty", "-dirty", "--no-dirty-hash")
+    assert code == 0
+    # D is off main's first-parent chain; its anchor is M itself (D's
+    # parent, since D has no first-parent-chain commits of main beyond M).
+    # M's cohort is {M, B, C, A} = 4, not a first-parent-only count of 3.
+    assert out == "20260410.4-dirty"
+
+
+# --- Forward vs. reverse asymmetry across a pruned-away boundary ---
+
+
+def test_deep_skew_forward_succeeds_reverse_detects_decreasing(
+    git_repo: GitRepo,
+) -> None:
+    # First-parent chain dates, oldest to newest: D2, D1, D2, D2. Forward at
+    # the tip prunes the D1 commit's own (D2-dated) parent away without
+    # examining it, so it succeeds -- the deep skew is buried behind a
+    # strictly-older commit relative to the tip's cohort date. Reverse
+    # lookup for D1 fails in the block-delimiting first-parent walk (the
+    # unchanged 0.2 machinery), which streams past D1 into the D2-dated
+    # root and flags the date sequence as decreasing before any cohort is
+    # computed. The cohort walk's own rejection paths are covered by
+    # test_reverse_rejects_future_date_in_member_cohort and
+    # test_reverse_shallow_second_parent_exits_4.
+    git_repo.commit_at("2026-04-11T09:00:00Z")  # root: D2
+    git_repo.commit_at("2026-04-10T09:00:00Z")  # D1
+    git_repo.commit_at("2026-04-11T09:00:00Z")  # D2
+    git_repo.commit_at("2026-04-11T10:00:00Z")  # tip: D2
+
+    out, code = run_cmd(git_repo)
+    assert code == 0
+    assert out == "20260411.2"
+
+    _, code = run_cmd(git_repo, "20260410.1")
+    assert code == 1
 
 
 # --- Branch detection ---

@@ -1,6 +1,7 @@
 # Copyright © 2026 Michael Shields
 # SPDX-License-Identifier: MIT
 
+import datetime
 import os
 import subprocess
 from collections.abc import Generator
@@ -175,3 +176,81 @@ def first_parent_log(
         if returncode != 0:
             msg = f"git log {rev} failed"
             raise GitError(msg)
+
+
+class CommitReader:
+    """Read commit objects one at a time through `git cat-file --batch`.
+
+    The date-cohort walk only ever needs the cohort itself plus its
+    immediate frontier, so objects are read on demand instead of dumping the
+    whole history. Raw objects also expose stored parents even at
+    shallow-clone boundaries (the grafts that hide them apply to traversal,
+    not object storage), so a true root is exactly a commit with no parent
+    lines, and a hidden or missing parent is exactly an absent object.
+    """
+
+    def __init__(self, dir: str | None = None) -> None:
+        try:
+            self._proc = subprocess.Popen(
+                ["git", "cat-file", "--batch"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                cwd=dir,
+                env=_env(),
+            )
+        except OSError as e:
+            raise GitError(_os_error_message(e)) from e
+
+    def close(self) -> None:
+        proc = self._proc
+        if proc.stdin is not None:
+            proc.stdin.close()
+        if proc.stdout is not None:
+            proc.stdout.close()
+        proc.wait()
+
+    def read(self, rev: str) -> tuple[str, list[str], str] | None:
+        """Return (oid, parent oids, UTC committer date) or None if absent.
+
+        One request and exactly one response per call, so the pipe cannot
+        deadlock. The date is derived from the committer epoch seconds,
+        ignoring the stored timezone offset.
+        """
+        proc = self._proc
+        if proc.stdin is None or proc.stdout is None or proc.poll() is not None:
+            msg = "git cat-file exited unexpectedly"
+            raise GitError(msg)
+        try:
+            proc.stdin.write(rev.encode() + b"\n")
+            proc.stdin.flush()
+            header = proc.stdout.readline()
+        except OSError as e:
+            raise GitError(str(e)) from e
+        match header.split():
+            case [_, b"missing" | b"ambiguous"]:
+                return None
+            case [oid_field, b"commit", size_field]:
+                oid = oid_field.decode()
+                size = int(size_field)
+            case _:
+                msg = f"unexpected cat-file response for {rev}"
+                raise GitError(msg)
+        body = proc.stdout.read(size + 1)[:size]
+        parents: list[str] = []
+        committer_epoch: int | None = None
+        for line in body.split(b"\n"):
+            if not line:
+                break
+            key, _, value = line.partition(b" ")
+            if key == b"parent":
+                parents.append(value.decode())
+            elif key == b"committer":
+                committer_epoch = int(value.rsplit(b" ", 2)[-2])
+        if committer_epoch is None:
+            msg = f"cannot parse commit {oid}"
+            raise GitError(msg)
+        date = datetime.datetime.fromtimestamp(
+            committer_epoch, datetime.timezone.utc
+        ).strftime("%Y%m%d")
+        return oid, parents, date
