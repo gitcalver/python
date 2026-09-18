@@ -15,7 +15,7 @@ jobs:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     outputs:
@@ -35,7 +35,7 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: tag
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     environment:
       # PyPI's trusted publisher is bound to this workflow file and environment.
       name: pypi
