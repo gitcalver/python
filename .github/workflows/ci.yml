@@ -64,7 +64,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv python install 3.14
-      - uses: gitcalver/sh@a7f5c0600057d05028467cda8c65b36d5aa1eaf5 # v20260719.1
+      - uses: gitcalver/sh@857287da052d1437703ead1f7d2adc76a95451ba # v20260825.1
         id: version
         with:
           dirty: +dirty
