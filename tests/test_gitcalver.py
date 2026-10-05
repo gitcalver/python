@@ -3,24 +3,25 @@
 
 from __future__ import annotations
 
+import os
+import shlex
+import shutil
 import subprocess
 import sys
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
 import gitcalver
 from gitcalver._branch import detect_branch
 from gitcalver._errors import ExitError, IncompleteHistoryError
+from gitcalver._git import GitError, git, is_git_repo, rev_list_is_complete
 from gitcalver._hatch_hooks import hatch_register_version_source
 from gitcalver._hatch_source import GitCalverSource
 from gitcalver._version import reverse, walk_cohort
 from gitcalver.cli import _parse_args, main, run
 
 from _helpers import GitRepo
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def run_cmd(repo: GitRepo, *extra_args: str, branch: str = "main") -> tuple[str, int]:
@@ -211,8 +212,162 @@ def test_off_branch_orphan_exits_3(git_repo: GitRepo) -> None:
 
 def test_not_a_repo(tmp_path: Path) -> None:
     repo = GitRepo(dir=str(tmp_path))
-    _, code = run_cmd(repo)
+    out, code = run_cmd(repo)
     assert code == 1
+    assert out == "gitcalver: not a git repository"
+
+
+def test_invalid_git_dir_reports_git_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / "missing"
+    monkeypatch.setenv("GIT_DIR", str(missing))
+    out, code = run([], dir=str(tmp_path))
+    assert code == 1
+    assert out == f"gitcalver: fatal: not a git repository: '{missing}'"
+
+
+@pytest.mark.parametrize(
+    "locale_env",
+    [
+        pytest.param({"LC_ALL": "de_DE.UTF-8", "LANGUAGE": "de"}, id="lc_all_de"),
+        pytest.param({"LC_ALL": "fr_FR.UTF-8", "LANGUAGE": "fr"}, id="lc_all_fr"),
+        pytest.param(
+            {"LC_ALL": "", "LC_MESSAGES": "", "LANG": "de_DE.UTF-8", "LANGUAGE": "de"},
+            id="lang_de",
+        ),
+    ],
+)
+def test_not_a_repo_localized_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, locale_env: dict[str, str]
+) -> None:
+    for name, value in locale_env.items():
+        monkeypatch.setenv(name, value)
+    out, code = run([], dir=str(tmp_path))
+    assert code == 1
+    assert out == "gitcalver: not a git repository"
+
+
+@pytest.mark.parametrize(
+    "english",
+    [
+        pytest.param(
+            "fatal: not a git repository (or any of the parent directories): .git",
+            id="parent_directories",
+        ),
+        pytest.param(
+            "fatal: not a git repository (or any parent up to mount point /mnt)\n"
+            "Stopping at filesystem boundary "
+            "(GIT_DISCOVERY_ACROSS_FILESYSTEM not set).",
+            id="mount_point",
+        ),
+    ],
+)
+def test_not_a_repo_probe_uses_c_locale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, english: str
+) -> None:
+    fake_git = tmp_path / "bin" / "git"
+    fake_git.parent.mkdir()
+    german = "Schwerwiegend: Kein Git-Repository (oder eines der Elternverzeichnisse)"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$LC_ALL" = C ]; then printf "%s\\n" "{english}"\n'
+        f'else printf "%s\\n" "{german}"; fi >&2\n'
+        "exit 128\n"
+    )
+    fake_git.chmod(0o755)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.setenv("PATH", str(fake_git.parent), prepend=os.pathsep)
+    monkeypatch.setenv("LANGUAGE", "de")
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+    out, code = run([], dir=str(work))
+    assert code == 1
+    assert out == "gitcalver: not a git repository"
+
+
+@pytest.mark.parametrize(
+    ("config", "want"),
+    [
+        pytest.param(
+            "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tbogus = true\n",
+            "unknown repository extension",
+            id="extension",
+        ),
+        pytest.param("[core\n", "bad config", id="corrupt_config"),
+    ],
+)
+def test_unusable_repo_reports_git_error(
+    git_repo: GitRepo, config: str, want: str
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.write_file(".git/config", config)
+
+    out, code = run_cmd(git_repo)
+    assert code == 1
+    assert want in out
+    assert "not a git repository" not in out
+
+    with pytest.raises(GitError, match=want):
+        is_git_repo(dir=git_repo.dir)
+
+
+def test_echoed_discovery_text_is_not_a_missing_repo(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = Path(git_repo.dir, "not a git repository (or any x", "gitconfig")
+    config.parent.mkdir()
+    config.write_text("[core\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+
+    out, code = run_cmd(git_repo)
+    assert code == 1
+    assert f"bad config line 1 in file {config}" in out
+
+    with pytest.raises(GitError, match="bad config"):
+        is_git_repo(dir=git_repo.dir)
+
+
+def test_non_utf8_commit_object_is_read(git_repo: GitRepo) -> None:
+    when = "2026-04-10T09:00:00Z"
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Andr\udce9",
+        "GIT_AUTHOR_EMAIL": "andre@example.com",
+        "GIT_AUTHOR_DATE": when,
+        "GIT_COMMITTER_NAME": "Andr\udce9",
+        "GIT_COMMITTER_EMAIL": "andre@example.com",
+        "GIT_COMMITTER_DATE": when,
+    }
+    git_repo.git(
+        "-c",
+        "i18n.commitEncoding=ISO-8859-1",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "r\udce9sum\udce9",
+        env=env,
+    )
+
+    out, code = run_cmd(git_repo, "20200101.1")
+    assert code == 1
+    assert out == "gitcalver: version not found: 20200101.1"
+
+
+def test_non_utf8_git_stderr_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_git = tmp_path / "bin" / "git"
+    fake_git.parent.mkdir()
+    fake_git.write_text('#!/bin/sh\nprintf "fatal: caf\\351\\n" >&2\nexit 128\n')
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_git.parent), prepend=os.pathsep)
+
+    with pytest.raises(GitError, match="fatal: caf"):
+        git("rev-parse", "HEAD", dir=str(tmp_path))
+    with pytest.raises(GitError, match="fatal: caf"):
+        rev_list_is_complete("HEAD", dir=str(tmp_path))
 
 
 def test_empty_repo(tmp_path: Path) -> None:
@@ -1206,7 +1361,7 @@ def test_cli_main_reverse(
         main(["--branch", "main", "20260410.1"])
     assert exc_info.value.code == 0
     out = capsys.readouterr().out.strip()
-    assert len(out) == 40  # full SHA
+    assert out == git_repo.head_hash()
 
 
 # --- CLI parsing ---
@@ -1445,7 +1600,8 @@ def test_shallow_clone_with_older_date_boundary_succeeds(tmp_path: Path) -> None
 # --- Partial clone accepted ---
 
 
-def test_partial_clone_accepted(tmp_path: Path) -> None:
+@pytest.fixture
+def partial_source(tmp_path: Path) -> GitRepo:
     origin_dir = str(tmp_path / "origin")
     subprocess.run(
         ["git", "init", "-b", "main", origin_dir],
@@ -1453,19 +1609,132 @@ def test_partial_clone_accepted(tmp_path: Path) -> None:
         check=True,
     )
     origin = GitRepo(dir=origin_dir)
+    origin.git("config", "uploadpack.allowFilter", "true")
+    origin.write_file("partial.txt", "one")
+    origin.git("add", "partial.txt")
     origin.commit_at("2026-04-10T09:00:00Z")
-    origin.commit_at("2026-04-10T10:00:00Z")
+    origin.write_file("partial.txt", "two")
+    origin.git("add", "partial.txt")
+    origin.commit_at("2026-04-11T09:00:00Z")
+    return origin
 
+
+def _missing_objects(repo: GitRepo) -> set[str]:
+    listing = repo.git("rev-list", "--objects", "--missing=print", "HEAD")
+    return {
+        line.removeprefix("?") for line in listing.splitlines() if line.startswith("?")
+    }
+
+
+def test_partial_clone_accepted(tmp_path: Path, partial_source: GitRepo) -> None:
     clone_dir = str(tmp_path / "clone")
     subprocess.run(
-        ["git", "clone", "--filter=blob:none", f"file://{origin_dir}", clone_dir],
+        [
+            "git",
+            "clone",
+            "--filter=blob:none",
+            f"file://{partial_source.dir}",
+            clone_dir,
+        ],
         capture_output=True,
         check=True,
     )
     clone = GitRepo(dir=clone_dir)
-    out, code = run_cmd(clone)
+    assert clone.git("config", "remote.origin.promisor") == "true"
+    assert clone.git("config", "remote.origin.partialclonefilter") == "blob:none"
+    absent_blobs = {partial_source.git("rev-parse", "HEAD~1:partial.txt")}
+    assert _missing_objects(clone) == absent_blobs
+
+    out, code = run_cmd(clone, branch="")
+    assert code == 0
+    assert out == "20260411.1"
+    out, code = run_cmd(clone, "20260411.1", branch="")
+    assert code == 0
+    assert out == partial_source.head_hash()
+    assert _missing_objects(clone) == absent_blobs
+
+
+def test_missing_promised_commit_is_not_lazy_fetched(
+    tmp_path: Path, partial_source: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tip = partial_source.head_hash()
+    parent = partial_source.parent_hash()
+
+    repo_dir = tmp_path / "promisor"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo_dir)],
+        capture_output=True,
+        check=True,
+    )
+    repo = GitRepo(dir=str(repo_dir))
+    repo.git("config", "core.repositoryformatversion", "1")
+    repo.git("config", "extensions.partialClone", "blocked")
+    repo.git("config", "remote.blocked.promisor", "true")
+    repo.git("config", "remote.blocked.partialCloneFilter", "blob:none")
+    repo.git("config", "remote.blocked.url", "blocked::missing")
+    fan_out = repo_dir / ".git" / "objects" / tip[:2]
+    fan_out.mkdir()
+    shutil.copyfile(
+        Path(partial_source.dir, ".git", "objects", tip[:2], tip[2:]),
+        fan_out / tip[2:],
+    )
+    repo.git("update-ref", "refs/heads/main", tip)
+
+    marker = tmp_path / "lazy-fetch-attempted"
+    helper_dir = tmp_path / "blocked-bin"
+    helper_dir.mkdir()
+    helper = helper_dir / "git-remote-blocked"
+    helper.write_text(f"#!/bin/sh\n: >{shlex.quote(str(marker))}\nexit 1\n")
+    helper.chmod(0o755)
+    monkeypatch.setenv("PATH", str(helper_dir), prepend=os.pathsep)
+
+    subprocess.run(
+        ["git", "cat-file", "-e", f"{parent}^{{commit}}"],
+        capture_output=True,
+        cwd=repo_dir,
+        env={**os.environ, "GIT_NO_LAZY_FETCH": "0"},
+        check=False,
+    )
+    assert marker.exists()
+    marker.unlink()
+
+    out, code = run_cmd(repo, "HEAD")
+    assert code == 4
+    assert "local history ended" in out
+    out, code = run_cmd(repo, "20260411.1")
+    assert code == 4
+    assert "local history ended" in out
+    out, code = run_cmd(repo, parent)
+    assert code == 4
+    assert "revision is missing from local history" in out
+    assert not marker.exists()
+
+
+# --- Replacement refs ignored ---
+
+
+def test_replace_refs_ignored(git_repo: GitRepo) -> None:
+    parent = git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.commit_at("2026-04-10T12:00:00Z")
+    git_repo.git("replace", "--graft", "HEAD")
+    out, code = run_cmd(git_repo)
     assert code == 0
     assert out == "20260410.2"
+    out, code = run_cmd(git_repo, parent)
+    assert code == 0
+    assert out == "20260410.1"
+    out, code = run_cmd(git_repo, "20260410.1")
+    assert code == 0
+    assert out == parent
+
+    git_repo.git("checkout", "--orphan", "side")
+    missing = git_repo.commit_at("2026-04-10T13:00:00Z")
+    git_repo.commit_at("2026-04-10T14:00:00Z")
+    git_repo.git("replace", "--graft", "HEAD")
+    Path(git_repo.dir, ".git", "objects", missing[:2], missing[2:]).unlink()
+    out, code = run_cmd(git_repo)
+    assert code == 4
+    assert "reachability" in out
 
 
 # --- Empty repo error message ---
@@ -1481,3 +1750,29 @@ def test_empty_repo_message(tmp_path: Path) -> None:
     out, code = run_cmd(repo)
     assert code == 1
     assert "no commits" in out
+
+
+def test_orphan_branch_without_commits(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.git("checkout", "--orphan", "fresh")
+    out, code = run_cmd(git_repo)
+    assert code == 1
+    assert out == "gitcalver: no commits in repository"
+
+
+def test_empty_loose_ref_is_not_reported_as_no_commits(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.write_file(".git/refs/heads/main", "")
+    out, code = run_cmd(git_repo)
+    assert code == 1
+    assert out == "gitcalver: cannot read HEAD: the reference HEAD names is broken"
+
+
+def test_garbage_packed_refs_is_not_reported_as_no_commits(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.git("pack-refs", "--all")
+    git_repo.write_file(".git/packed-refs", "garbage\n")
+    out, code = run_cmd(git_repo)
+    assert code == 1
+    assert out.startswith("gitcalver: cannot read HEAD: ")
+    assert "unexpected line in" in out

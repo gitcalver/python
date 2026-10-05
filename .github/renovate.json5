@@ -2,6 +2,23 @@
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   extends: ["config:best-practices", ":semanticCommitsDisabled"],
   platformAutomerge: true,
+  customManagers: [
+    {
+      description: "Conformance suite pin of gitcalver/sh, bumped with its action pins",
+      customType: "regex",
+      // `managerFilePatterns` is the current option name; Renovate's validator
+      // rejects the older `fileMatch`. A slash-wrapped entry is a regex and
+      // any other entry is a glob.
+      managerFilePatterns: ["/^Makefile$/", "/^\\.github/workflows/ci\\.yml$/"],
+      matchStrings: [
+        "# gitcalver/sh (?<currentValue>v\\S+)\\nCONFORMANCE_SHA := (?<currentDigest>[0-9a-f]{40})",
+        "repository: gitcalver/sh\\s+ref: (?<currentDigest>[0-9a-f]{40}) # (?<currentValue>v\\S+)",
+      ],
+      depNameTemplate: "gitcalver/sh",
+      datasourceTemplate: "github-tags",
+      versioningTemplate: "github-actions",
+    },
+  ],
   packageRules: [
     {
       description: "Automerge non-major updates",

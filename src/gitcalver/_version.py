@@ -62,7 +62,12 @@ def _validate_repo(dir: str | None) -> _RepoState:
         msg = f"commit graft file is not supported: {graft_file}"
         raise IncompleteHistoryError(msg)
 
-    if not _git.has_commits(dir=dir):
+    try:
+        has_commits = _git.has_commits(dir=dir)
+    except _git.GitError as e:
+        msg = f"cannot read HEAD: {e}"
+        raise ExitError(msg) from e
+    if not has_commits:
         msg = "no commits in repository"
         raise ExitError(msg)
 

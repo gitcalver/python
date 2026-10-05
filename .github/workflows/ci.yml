@@ -37,6 +37,9 @@ jobs:
 
   conformance:
     runs-on: ubuntu-26.04
+    strategy:
+      matrix:
+        object-format: [sha1, sha256]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -44,13 +47,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: gitcalver/sh
-          ref: c89d24c9ac36f0672ecfff9727532e344bfa9af9
+          ref: 857287da052d1437703ead1f7d2adc76a95451ba # v20260825.1
           path: conformance-sh
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           enable-cache: true
+          cache-suffix: ${{ matrix.object-format }}
       - run: uv python install 3.14
       - run: make test-conformance CONFORMANCE_DIR=conformance-sh
+        env:
+          GIT_DEFAULT_HASH: ${{ matrix.object-format }}
 
   build:
     name: Build distribution

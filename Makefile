@@ -1,7 +1,10 @@
 .PHONY: sync test test-conformance lint fmt
 
 CONFORMANCE_DIR ?= ../sh
-CONFORMANCE_SHA := c89d24c9ac36f0672ecfff9727532e344bfa9af9
+# Renovate reads the version from the comment below. It must stay on its own
+# line: Make keeps the space before a trailing comment in the value.
+# gitcalver/sh v20260825.1
+CONFORMANCE_SHA := 857287da052d1437703ead1f7d2adc76a95451ba
 
 sync:
 	uv sync --frozen
@@ -11,7 +14,8 @@ test: sync
 
 test-conformance: sync
 	@test "$$(git -C "$(CONFORMANCE_DIR)" rev-parse "$(CONFORMANCE_SHA)^{commit}")" = "$(CONFORMANCE_SHA)"
-	@tmp="$$(mktemp)"; \
+	@set -e; \
+	tmp="$$(mktemp)"; \
 	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
 	git -C "$(CONFORMANCE_DIR)" show "$(CONFORMANCE_SHA):test/test.sh" >"$$tmp"; \
 	GITCALVER="$(CURDIR)/test/conformance-wrapper.sh" sh "$$tmp"

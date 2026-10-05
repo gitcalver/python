@@ -168,6 +168,8 @@ source = "gitcalver"
   traverses past it. GitCalVer never fetches missing history during a
   calculation.
 
+Both SHA-1 and SHA-256 repositories are supported.
+
 ## License
 
 MIT

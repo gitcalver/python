@@ -3,6 +3,7 @@
 
 import datetime
 import os
+import re
 import subprocess
 from collections.abc import Generator
 from pathlib import Path
@@ -21,7 +22,7 @@ def _os_error_message(e: OSError) -> str:
     return str(e)
 
 
-def _env(*, utc: bool = False) -> dict[str, str]:
+def _env(*, utc: bool = False, c_locale: bool = False) -> dict[str, str]:
     env = {
         **os.environ,
         "GIT_NO_LAZY_FETCH": "1",
@@ -29,17 +30,22 @@ def _env(*, utc: bool = False) -> dict[str, str]:
     }
     if utc:
         env["TZ"] = "UTC"
+    if c_locale:
+        env["LC_ALL"] = "C"
     return env
 
 
-def _run(*args: str, dir: str | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    *args: str, dir: str | None = None, c_locale: bool = False
+) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             ["git", *args],
             capture_output=True,
             text=True,
+            errors="surrogateescape",
             cwd=dir,
-            env=_env(),
+            env=_env(c_locale=c_locale),
             check=False,
         )
     except OSError as e:
@@ -71,12 +77,36 @@ def object_id_prefix(rev: str, dir: str | None = None) -> str:
     return rev_parse(rev, dir=dir)[:_HASH_PREFIX_LEN].lower()
 
 
+_NOT_A_REPO = re.compile(r"^fatal: not a git repository \(or any ", re.MULTILINE)
+
+
 def is_git_repo(dir: str | None = None) -> bool:
-    return git_ok("rev-parse", "--git-dir", dir=dir)
+    """Return whether `dir` is inside a repository; raise GitError if git refuses.
+
+    Git exits 128 both when no repository is found and when one is found but
+    unusable (unknown extension, dubious ownership, corrupt config), so the
+    two are told apart by the discovery-failure message. LC_ALL=C pins that
+    message to English; LANGUAGE is ignored under the C locale. The match is
+    anchored to a line start because the other failures echo paths, which can
+    contain the same words.
+    """
+    result = _run("rev-parse", "--git-dir", dir=dir, c_locale=True)
+    if result.returncode == 0:
+        return True
+    if _NOT_A_REPO.search(result.stderr):
+        return False
+    raise GitError(result.stderr.strip() or "git rev-parse --git-dir failed")
 
 
 def has_commits(dir: str | None = None) -> bool:
-    return git_ok("rev-parse", "--verify", "HEAD", dir=dir)
+    head = _run("rev-parse", "--verify", "--quiet", "HEAD", dir=dir)
+    if head.returncode == 0:
+        return True
+    # An unborn branch and a broken ref both exit 1 without a message; only the
+    # unborn branch leaves HEAD readable by symbolic-ref.
+    if head.returncode == 1 and git_ok("symbolic-ref", "--quiet", "HEAD", dir=dir):
+        return False
+    raise GitError(head.stderr.strip() or "the reference HEAD names is broken")
 
 
 def is_dirty(dir: str | None = None) -> bool:
@@ -134,6 +164,7 @@ def rev_list_is_complete(rev: str, dir: str | None = None) -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            errors="surrogateescape",
             cwd=dir,
             env=_env(),
             check=False,
