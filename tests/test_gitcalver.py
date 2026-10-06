@@ -15,13 +15,22 @@ import pytest
 import gitcalver
 from gitcalver._branch import detect_branch
 from gitcalver._errors import ExitError, IncompleteHistoryError
-from gitcalver._git import GitError, git, is_git_repo, rev_list_is_complete
+from gitcalver._git import (
+    GitError,
+    _looks_like_repository,
+    git,
+    is_git_repo,
+    rev_list_is_complete,
+)
 from gitcalver._hatch_hooks import hatch_register_version_source
 from gitcalver._hatch_source import GitCalverSource
 from gitcalver._version import reverse, walk_cohort
 from gitcalver.cli import _parse_args, main, run
 
 from _helpers import GitRepo
+
+SENTINEL = "sentinel-4f2c9a7e git refused this directory"
+NOT_A_REPO = "gitcalver: not a git repository"
 
 
 def run_cmd(repo: GitRepo, *extra_args: str, branch: str = "main") -> tuple[str, int]:
@@ -214,118 +223,320 @@ def test_not_a_repo(tmp_path: Path) -> None:
     repo = GitRepo(dir=str(tmp_path))
     out, code = run_cmd(repo)
     assert code == 1
-    assert out == "gitcalver: not a git repository"
+    assert out == NOT_A_REPO
 
 
+def _git_stderr(directory: str, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=directory, capture_output=True, text=True, check=False
+    )
+    assert result.returncode != 0
+    return result.stderr.strip()
+
+
+@pytest.mark.parametrize("git_dir", ["missing", ""], ids=["missing", "empty"])
 def test_invalid_git_dir_reports_git_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, git_dir: str
 ) -> None:
-    missing = tmp_path / "missing"
-    monkeypatch.setenv("GIT_DIR", str(missing))
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / git_dir) if git_dir else "")
+    said = _git_stderr(str(tmp_path), "rev-parse", "--git-dir")
+    assert said
+
     out, code = run([], dir=str(tmp_path))
     assert code == 1
-    assert out == f"gitcalver: fatal: not a git repository: '{missing}'"
+    assert out != NOT_A_REPO
+    assert out == f"gitcalver: {said}"
+
+    with pytest.raises(GitError) as raised:
+        is_git_repo(dir=str(tmp_path))
+    assert str(raised.value) == said
 
 
-@pytest.mark.parametrize(
-    "locale_env",
-    [
-        pytest.param({"LC_ALL": "de_DE.UTF-8", "LANGUAGE": "de"}, id="lc_all_de"),
-        pytest.param({"LC_ALL": "fr_FR.UTF-8", "LANGUAGE": "fr"}, id="lc_all_fr"),
-        pytest.param(
-            {"LC_ALL": "", "LC_MESSAGES": "", "LANG": "de_DE.UTF-8", "LANGUAGE": "de"},
-            id="lang_de",
-        ),
-    ],
-)
-def test_not_a_repo_localized_env(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, locale_env: dict[str, str]
+def _fake_failing_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stderr: str, status: int = 128
 ) -> None:
-    for name, value in locale_env.items():
-        monkeypatch.setenv(name, value)
-    out, code = run([], dir=str(tmp_path))
-    assert code == 1
-    assert out == "gitcalver: not a git repository"
-
-
-@pytest.mark.parametrize(
-    "english",
-    [
-        pytest.param(
-            "fatal: not a git repository (or any of the parent directories): .git",
-            id="parent_directories",
-        ),
-        pytest.param(
-            "fatal: not a git repository (or any parent up to mount point /mnt)\n"
-            "Stopping at filesystem boundary "
-            "(GIT_DISCOVERY_ACROSS_FILESYSTEM not set).",
-            id="mount_point",
-        ),
-    ],
-)
-def test_not_a_repo_probe_uses_c_locale(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, english: str
-) -> None:
-    fake_git = tmp_path / "bin" / "git"
-    fake_git.parent.mkdir()
-    german = "Schwerwiegend: Kein Git-Repository (oder eines der Elternverzeichnisse)"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "stderr.txt").write_text(stderr, encoding="utf-8")
+    fake_git = bin_dir / "git"
     fake_git.write_text(
-        "#!/bin/sh\n"
-        f'if [ "$LC_ALL" = C ]; then printf "%s\\n" "{english}"\n'
-        f'else printf "%s\\n" "{german}"; fi >&2\n'
-        "exit 128\n"
+        f'#!/bin/sh\ncat "$(dirname "$0")/stderr.txt" >&2\nexit {status}\n'
     )
     fake_git.chmod(0o755)
-    work = tmp_path / "work"
-    work.mkdir()
-    monkeypatch.setenv("PATH", str(fake_git.parent), prepend=os.pathsep)
-    monkeypatch.setenv("LANGUAGE", "de")
-    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
-    out, code = run([], dir=str(work))
-    assert code == 1
-    assert out == "gitcalver: not a git repository"
+    assert os.access(fake_git, os.X_OK), "tmp_path is on a noexec filesystem"
+    monkeypatch.setenv("PATH", str(bin_dir), prepend=os.pathsep)
+
+
+# The probe walks the real filesystem above tmp_path, which can hold a repository
+# when pytest runs with --basetemp or TMPDIR inside one.
+@pytest.fixture
+def markers_only_in_tmp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "gitcalver._git._looks_like_repository",
+        lambda path: path.is_relative_to(tmp_path) and _looks_like_repository(path),
+    )
+
+
+def _add_repository_marker(directory: Path, marker: str) -> None:
+    match marker:
+        case "directory":
+            (directory / ".git").mkdir()
+        case "gitfile":
+            (directory / ".git").write_text("gitdir: ../nowhere\n")
+        case "broken_symlink":
+            (directory / ".git").symlink_to(directory / "nowhere")
+        case "bare_layout":
+            (directory / "HEAD").write_text("ref: refs/heads/main\n")
+            (directory / "objects").mkdir()
+            (directory / "refs").mkdir()
+        case "symlinked_head":
+            (directory / "HEAD").symlink_to("refs/heads/main")
+            (directory / "objects").mkdir()
+            (directory / "refs").mkdir()
+        case _:
+            raise AssertionError(marker)
 
 
 @pytest.mark.parametrize(
-    ("config", "want"),
+    "stderr",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("error: something entirely unrelated", id="unrelated"),
+        pytest.param(
+            "Schwerwiegend: Kein Git-Repository (oder eines der Elternverzeichnisse)",
+            id="german",
+        ),
+        pytest.param(
+            "fatal : ceci n'est pas un d\u00e9p\u00f4t git (ni aucun des parents)",
+            id="french",
+        ),
+        pytest.param(
+            "\u81f4\u547d\u9519\u8bef\uff1a\u4e0d\u662f git \u4ed3\u5e93", id="chinese"
+        ),
+        pytest.param(
+            "fatal: unknown repository extensions found: bogus", id="other_failure"
+        ),
+    ],
+)
+@pytest.mark.usefixtures("markers_only_in_tmp_path")
+def test_not_a_repo_does_not_depend_on_git_wording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stderr: str
+) -> None:
+    _fake_failing_git(tmp_path, monkeypatch, stderr)
+    work = tmp_path / "work"
+    work.mkdir()
+
+    out, code = run([], dir=str(work))
+    assert code == 1
+    assert out == NOT_A_REPO
+    assert is_git_repo(dir=str(work)) is False
+
+
+@pytest.mark.parametrize("status", [1, 127, 129])
+@pytest.mark.usefixtures("markers_only_in_tmp_path")
+def test_git_failing_without_dying_is_reported_as_a_git_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    _fake_failing_git(tmp_path, monkeypatch, SENTINEL, status=status)
+    work = tmp_path / "work"
+    work.mkdir()
+
+    out, code = run([], dir=str(work))
+    assert code == 1
+    assert out == f"gitcalver: {SENTINEL}"
+
+    with pytest.raises(GitError, match=SENTINEL):
+        is_git_repo(dir=str(work))
+
+
+@pytest.mark.parametrize("below", [False, True], ids=["same_dir", "subdirectory"])
+@pytest.mark.parametrize(
+    "marker",
+    ["directory", "gitfile", "broken_symlink", "bare_layout", "symlinked_head"],
+)
+def test_repository_marker_relays_git_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str, below: bool
+) -> None:
+    _fake_failing_git(tmp_path, monkeypatch, SENTINEL)
+    work = tmp_path / "work"
+    work.mkdir()
+    _add_repository_marker(work, marker)
+    probe = work / "a" / "b" if below else work
+    probe.mkdir(parents=True, exist_ok=True)
+
+    out, code = run([], dir=str(probe))
+    assert code == 1
+    assert out == f"gitcalver: {SENTINEL}"
+
+    with pytest.raises(GitError, match=SENTINEL):
+        is_git_repo(dir=str(probe))
+
+
+def test_repository_marker_without_stderr_names_the_failed_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_failing_git(tmp_path, monkeypatch, "")
+    work = tmp_path / "work"
+    work.mkdir()
+    _add_repository_marker(work, "directory")
+
+    out, code = run([], dir=str(work))
+    assert code == 1
+    assert out == "gitcalver: git rev-parse --git-dir failed"
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        pytest.param({"HEAD": "dir", "objects": "dir", "refs": "dir"}, id="head_dir"),
+        pytest.param({"HEAD": "file", "objects": "dir"}, id="no_refs"),
+        pytest.param({"HEAD": "file", "refs": "dir"}, id="no_objects"),
+        pytest.param({"objects": "dir"}, id="lone_objects"),
+        pytest.param(
+            {"HEAD": "file", "objects": "file", "refs": "dir"}, id="objects_file"
+        ),
+        pytest.param(
+            {"HEAD": "file", "objects": "dir", "refs": "file"}, id="refs_file"
+        ),
+    ],
+)
+@pytest.mark.usefixtures("markers_only_in_tmp_path")
+def test_incomplete_bare_layout_is_not_a_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: dict[str, str]
+) -> None:
+    _fake_failing_git(tmp_path, monkeypatch, SENTINEL)
+    work = tmp_path / "work"
+    work.mkdir()
+    for name, kind in layout.items():
+        if kind == "dir":
+            (work / name).mkdir()
+        else:
+            (work / name).write_text("")
+
+    out, code = run([], dir=str(work))
+    assert code == 1
+    assert out == NOT_A_REPO
+    assert is_git_repo(dir=str(work)) is False
+
+
+def test_symlinked_directory_is_probed_through_its_physical_ancestors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_failing_git(tmp_path, monkeypatch, SENTINEL)
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "sub").mkdir()
+    link = tmp_path / "elsewhere" / "link"
+    link.parent.mkdir()
+    link.symlink_to(repo / "sub")
+
+    out, code = run([], dir=str(link))
+    assert code == 1
+    assert out == f"gitcalver: {SENTINEL}"
+
+
+@pytest.mark.parametrize("marked", [False, True], ids=["plain", "marked"])
+@pytest.mark.usefixtures("markers_only_in_tmp_path")
+def test_probe_defaults_to_current_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marked: bool
+) -> None:
+    _fake_failing_git(tmp_path, monkeypatch, SENTINEL)
+    work = tmp_path / "work"
+    (work / "sub").mkdir(parents=True)
+    if marked:
+        _add_repository_marker(work, "directory")
+    monkeypatch.chdir(work / "sub")
+
+    out, code = run([])
+    assert code == 1
+    assert out == (f"gitcalver: {SENTINEL}" if marked else NOT_A_REPO)
+
+
+def test_ceiling_directories_hiding_a_repository_still_fail(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sub = Path(git_repo.dir, "sub")
+    sub.mkdir()
+    GitRepo(dir=str(sub)).git("rev-parse", "--git-dir")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", os.path.realpath(git_repo.dir))
+    said = _git_stderr(str(sub), "rev-parse", "--git-dir")
+    assert said
+
+    out, code = run([], dir=str(sub))
+    assert code == 1
+    assert out != NOT_A_REPO
+    assert out == f"gitcalver: {said}"
+
+
+@pytest.mark.parametrize(
+    "getcwd_succeeds", [False, True], ids=["platform_getcwd", "getcwd_succeeds"]
+)
+def test_unreadable_ancestor_of_current_directory_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, getcwd_succeeds: bool
+) -> None:
+    parent = tmp_path / "parent"
+    work = parent / "work"
+    work.mkdir(parents=True)
+    monkeypatch.chdir(work)
+    cwd = str(Path.cwd())
+    parent.chmod(0)
+    real_access = os.access
+
+    # Root, and filesystems that ignore mode bits, can search `parent` anyway.
+    def access(path: str | os.PathLike[str], mode: int) -> bool:
+        return real_access(path, mode) and not Path(path).is_relative_to(parent)
+
+    try:
+        with monkeypatch.context() as patch:
+            if getcwd_succeeds:
+                patch.setattr(os, "getcwd", lambda: cwd)
+            patch.setattr(os, "access", access)
+            out, code = run([])
+    finally:
+        parent.chmod(0o755)
+    assert code == 1
+    assert out != NOT_A_REPO
+    assert out.startswith("gitcalver: ")
+
+
+def test_deleted_current_directory_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+
+    out, code = run([])
+    assert code == 1
+    assert out != NOT_A_REPO
+    assert out.startswith("gitcalver: ")
+
+
+@pytest.mark.parametrize(
+    "config",
     [
         pytest.param(
             "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tbogus = true\n",
-            "unknown repository extension",
             id="extension",
         ),
-        pytest.param("[core\n", "bad config", id="corrupt_config"),
+        pytest.param("[core\n", id="corrupt_config"),
     ],
 )
-def test_unusable_repo_reports_git_error(
-    git_repo: GitRepo, config: str, want: str
-) -> None:
+def test_unusable_repo_reports_git_error(git_repo: GitRepo, config: str) -> None:
     git_repo.commit_at("2026-04-10T09:00:00Z")
     git_repo.write_file(".git/config", config)
+    said = _git_stderr(git_repo.dir, "rev-parse", "--git-dir")
+    assert said
 
     out, code = run_cmd(git_repo)
     assert code == 1
-    assert want in out
-    assert "not a git repository" not in out
+    assert out != NOT_A_REPO
+    assert out == f"gitcalver: {said}"
 
-    with pytest.raises(GitError, match=want):
+    with pytest.raises(GitError) as raised:
         is_git_repo(dir=git_repo.dir)
-
-
-def test_echoed_discovery_text_is_not_a_missing_repo(
-    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = Path(git_repo.dir, "not a git repository (or any x", "gitconfig")
-    config.parent.mkdir()
-    config.write_text("[core\n")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
-
-    out, code = run_cmd(git_repo)
-    assert code == 1
-    assert f"bad config line 1 in file {config}" in out
-
-    with pytest.raises(GitError, match="bad config"):
-        is_git_repo(dir=git_repo.dir)
+    assert str(raised.value) == said
 
 
 def test_non_utf8_commit_object_is_read(git_repo: GitRepo) -> None:
@@ -1765,14 +1976,64 @@ def test_empty_loose_ref_is_not_reported_as_no_commits(git_repo: GitRepo) -> Non
     git_repo.write_file(".git/refs/heads/main", "")
     out, code = run_cmd(git_repo)
     assert code == 1
-    assert out == "gitcalver: cannot read HEAD: the reference HEAD names is broken"
+    assert out.startswith("gitcalver: cannot read HEAD: ")
 
 
 def test_garbage_packed_refs_is_not_reported_as_no_commits(git_repo: GitRepo) -> None:
     git_repo.commit_at("2026-04-10T09:00:00Z")
     git_repo.git("pack-refs", "--all")
     git_repo.write_file(".git/packed-refs", "garbage\n")
+    said = _git_stderr(git_repo.dir, "rev-parse", "--verify", "--quiet", "HEAD")
+    assert said
     out, code = run_cmd(git_repo)
     assert code == 1
-    assert out.startswith("gitcalver: cannot read HEAD: ")
-    assert "unexpected line in" in out
+    assert out == f"gitcalver: cannot read HEAD: {said}"
+
+
+def _intercepting_git(
+    bin_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    responses: dict[str, tuple[int, str]],
+) -> None:
+    real_git = shutil.which("git")
+    assert real_git
+    cases = "".join(
+        f"{shlex.quote(args)}) printf '%s\\n' {shlex.quote(stderr)} >&2\n"
+        f"exit {code};;\n"
+        for args, (code, stderr) in responses.items()
+    )
+    fake_git = bin_dir / "git"
+    fake_git.write_text(
+        f'#!/bin/sh\ncase "$*" in\n{cases}esac\nexec {shlex.quote(real_git)} "$@"\n'
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir), prepend=os.pathsep)
+
+
+@pytest.mark.parametrize(
+    ("stderr", "tail"),
+    [
+        pytest.param(SENTINEL, SENTINEL, id="relays_git_stderr"),
+        pytest.param("", "the reference HEAD names is broken", id="no_stderr"),
+    ],
+)
+def test_unreadable_head_reports_cannot_read_head(
+    git_repo: GitRepo,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: str,
+    tail: str,
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    _intercepting_git(
+        tmp_path_factory.mktemp("shim"),
+        monkeypatch,
+        {
+            "rev-parse --verify --quiet HEAD": (1, stderr),
+            "symbolic-ref --quiet HEAD": (128, ""),
+        },
+    )
+
+    out, code = run_cmd(git_repo)
+    assert code == 1
+    assert out == f"gitcalver: cannot read HEAD: {tail}"

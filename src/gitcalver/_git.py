@@ -3,7 +3,6 @@
 
 import datetime
 import os
-import re
 import subprocess
 from collections.abc import Generator
 from pathlib import Path
@@ -14,6 +13,7 @@ class GitError(Exception):
 
 
 _HASH_PREFIX_LEN = 7
+_GIT_DIE_STATUS = 128
 
 
 def _os_error_message(e: OSError) -> str:
@@ -22,7 +22,7 @@ def _os_error_message(e: OSError) -> str:
     return str(e)
 
 
-def _env(*, utc: bool = False, c_locale: bool = False) -> dict[str, str]:
+def _env(*, utc: bool = False) -> dict[str, str]:
     env = {
         **os.environ,
         "GIT_NO_LAZY_FETCH": "1",
@@ -30,14 +30,10 @@ def _env(*, utc: bool = False, c_locale: bool = False) -> dict[str, str]:
     }
     if utc:
         env["TZ"] = "UTC"
-    if c_locale:
-        env["LC_ALL"] = "C"
     return env
 
 
-def _run(
-    *args: str, dir: str | None = None, c_locale: bool = False
-) -> subprocess.CompletedProcess[str]:
+def _run(*args: str, dir: str | None = None) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             ["git", *args],
@@ -45,7 +41,7 @@ def _run(
             text=True,
             errors="surrogateescape",
             cwd=dir,
-            env=_env(c_locale=c_locale),
+            env=_env(),
             check=False,
         )
     except OSError as e:
@@ -77,7 +73,38 @@ def object_id_prefix(rev: str, dir: str | None = None) -> str:
     return rev_parse(rev, dir=dir)[:_HASH_PREFIX_LEN].lower()
 
 
-_NOT_A_REPO = re.compile(r"^fatal: not a git repository \(or any ", re.MULTILINE)
+# os.path, not pathlib: Path.exists(), is_file(), is_dir() and is_symlink() raise
+# PermissionError on some Python versions when an ancestor cannot be searched,
+# while os.path treats any OSError as "no".
+def _looks_like_repository(path: Path) -> bool:
+    head = path / "HEAD"
+    return os.path.lexists(path / ".git") or (
+        # A symlink to a ref that does not exist yet is a valid HEAD.
+        os.path.lexists(head)
+        and not os.path.isdir(head)  # noqa: PTH112
+        and os.path.isdir(path / "objects")  # noqa: PTH112
+        and os.path.isdir(path / "refs")  # noqa: PTH112
+    )
+
+
+def _repository_may_exist(dir: str | None) -> bool:
+    """Return whether git's discovery from `dir` could have found a repository.
+
+    A bad GIT_DIR, an unreadable working directory or a directory on the path
+    that cannot be searched counts as possible, since none of them proves a
+    repository absent. GIT_CEILING_DIRECTORIES and filesystem boundaries are
+    not modeled: a repository they hide above `dir` still counts as present.
+    """
+    if "GIT_DIR" in os.environ:
+        return True
+    try:
+        start = Path(os.path.realpath(dir if dir is not None else Path.cwd()))
+    except OSError:
+        return True
+    return any(
+        _looks_like_repository(path) or not os.access(path, os.X_OK)
+        for path in (start, *start.parents)
+    )
 
 
 def is_git_repo(dir: str | None = None) -> bool:
@@ -85,17 +112,16 @@ def is_git_repo(dir: str | None = None) -> bool:
 
     Git exits 128 both when no repository is found and when one is found but
     unusable (unknown extension, dubious ownership, corrupt config), so the
-    two are told apart by the discovery-failure message. LC_ALL=C pins that
-    message to English; LANGUAGE is ignored under the C locale. The match is
-    anchored to a line start because the other failures echo paths, which can
-    contain the same words.
+    two are told apart by markers on the path, not by git's message, which
+    varies by version and locale. Any other status, such as a crash or a
+    wrapper's refusal, is git failing rather than finding no repository.
     """
-    result = _run("rev-parse", "--git-dir", dir=dir, c_locale=True)
+    result = _run("rev-parse", "--git-dir", dir=dir)
     if result.returncode == 0:
         return True
-    if _NOT_A_REPO.search(result.stderr):
-        return False
-    raise GitError(result.stderr.strip() or "git rev-parse --git-dir failed")
+    if result.returncode != _GIT_DIE_STATUS or _repository_may_exist(dir):
+        raise GitError(result.stderr.strip() or "git rev-parse --git-dir failed")
+    return False
 
 
 def has_commits(dir: str | None = None) -> bool:
