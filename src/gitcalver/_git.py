@@ -76,6 +76,14 @@ def object_id_prefix(rev: str, dir: str | None = None) -> str:
 # os.path, not pathlib: Path.exists(), is_file(), is_dir() and is_symlink() raise
 # PermissionError on some Python versions when an ancestor cannot be searched,
 # while os.path treats any OSError as "no".
+def path_exists(path: Path) -> bool:
+    return os.path.exists(path)  # noqa: PTH110
+
+
+def path_is_file(path: Path) -> bool:
+    return os.path.isfile(path)  # noqa: PTH113
+
+
 def _looks_like_repository(path: Path) -> bool:
     head = path / "HEAD"
     return os.path.lexists(path / ".git") or (
@@ -136,7 +144,14 @@ def has_commits(dir: str | None = None) -> bool:
 
 
 def is_dirty(dir: str | None = None) -> bool:
-    return git("status", "--porcelain", dir=dir) != ""
+    # status.showUntrackedFiles=no, in any config scope, makes a tree whose only
+    # change is an untracked file read clean, and the status that git runs
+    # inside each submodule reads the key too. -c reaches both; the
+    # --untracked-files option reaches only the superproject.
+    return (
+        git("-c", "status.showUntrackedFiles=normal", "status", "--porcelain", dir=dir)
+        != ""
+    )
 
 
 def is_bare(dir: str | None = None) -> bool:
@@ -174,19 +189,35 @@ def object_exists(object_spec: str, dir: str | None = None) -> bool:
 
 
 def stored_first_parent(commit: str, dir: str | None = None) -> str | None:
-    data = git("cat-file", "commit", commit, dir=dir)
-    for line in data.splitlines():
+    # Bytes, split on newlines only. As text, CR would be translated to a line
+    # break and str.splitlines() would also break at FF and U+2028, so an ident
+    # containing one followed by "parent " would pass for a parent header.
+    try:
+        result = subprocess.run(
+            ["git", "cat-file", "commit", commit],
+            capture_output=True,
+            cwd=dir,
+            env=_env(),
+            check=False,
+        )
+    except OSError as e:
+        raise GitError(_os_error_message(e)) from e
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="surrogateescape").strip()
+        raise GitError(stderr or f"git cat-file commit {commit} failed")
+    for line in result.stdout.split(b"\n"):
         if not line:
             break
-        if line.startswith("parent "):
-            return line.removeprefix("parent ")
+        if line.startswith(b"parent "):
+            return line.removeprefix(b"parent ").decode(errors="surrogateescape")
     return None
 
 
 def rev_list_is_complete(rev: str, dir: str | None = None) -> None:
     try:
         result = subprocess.run(
-            ["git", "rev-list", rev],
+            # A work-tree path named like the revision makes it ambiguous.
+            ["git", "rev-list", rev, "--"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -211,8 +242,16 @@ def first_parent_log(
                 "log",
                 rev,
                 "--first-parent",
+                # Each of these overrides a setting that adds or re-encodes the
+                # lines parsed below: log.showSignature prints verification text
+                # between entries, and i18n.logOutputEncoding or
+                # i18n.commitEncoding can select an ASCII-incompatible encoding.
+                "--no-show-signature",
+                "--encoding=UTF-8",
                 "--format=%H %cd",
                 "--date=format-local:%Y%m%d",
+                # A work-tree file named like the revision makes it ambiguous.
+                "--",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,

@@ -14,15 +14,6 @@ from _helpers import GitRepo
 OID_LENGTH = {"sha1": 40, "sha256": 64}
 
 
-def repo_object_format(path: str) -> str:
-    return subprocess.run(
-        ["git", "-C", path, "rev-parse", "--show-object-format"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-
-
 def test_git_environment_is_pinned() -> None:
     names = {name for name in os.environ if name.startswith("GIT_")}
     assert names == {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_DEFAULT_HASH"}
@@ -40,7 +31,7 @@ def test_git_repo_fixture_uses_object_format(
     git_repo: GitRepo, object_format: str
 ) -> None:
     git_repo.commit_at("2026-04-10T09:00:00Z")
-    assert repo_object_format(git_repo.dir) == object_format
+    assert git_repo.git("rev-parse", "--show-object-format") == object_format
     assert len(git_repo.head_hash()) == OID_LENGTH[object_format]
 
 

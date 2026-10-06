@@ -30,5 +30,12 @@
       matchDepTypes: ["devDependencies"],
       automerge: true,
     },
+    {
+      description: "Calendar-versioned gitcalver/sh releases",
+      matchDepNames: ["gitcalver/sh"],
+      // The release date is the major version, so the default maxMajorIncrement
+      // (500) would hide every release from a later year. Zero removes the limit.
+      maxMajorIncrement: 0,
+    },
   ],
 }

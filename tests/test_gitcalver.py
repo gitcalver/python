@@ -166,6 +166,111 @@ def test_gitignored_not_dirty(git_repo: GitRepo) -> None:
     assert code == 0
 
 
+def _disable_show_untracked_files(
+    repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    scope: str,
+) -> None:
+    match scope:
+        case "repository":
+            repo.git("config", "status.showUntrackedFiles", "no")
+        case "submodule":
+            GitRepo(dir=str(Path(repo.dir, "sm"))).git(
+                "config", "status.showUntrackedFiles", "no"
+            )
+        case "global":
+            config = tmp_path_factory.mktemp("config") / "gitconfig"
+            config.write_text("[status]\n\tshowUntrackedFiles = no\n")
+            monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+        case "environment":
+            monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+            monkeypatch.setenv("GIT_CONFIG_KEY_0", "status.showUntrackedFiles")
+            monkeypatch.setenv("GIT_CONFIG_VALUE_0", "no")
+        case _:
+            raise AssertionError(scope)
+
+
+@pytest.mark.parametrize("scope", ["repository", "global", "environment"])
+def test_untracked_dirty_when_show_untracked_files_disabled(
+    git_repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    scope: str,
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.write_file("dirty.txt")
+    _disable_show_untracked_files(git_repo, monkeypatch, tmp_path_factory, scope)
+    _, code = run_cmd(git_repo)
+    assert code == 2
+    out, code = run_cmd(git_repo, "--dirty", "-dirty")
+    assert code == 0
+    assert out.startswith("20260410.1-dirty.")
+
+
+@pytest.mark.parametrize(
+    "scope", ["none", "repository", "submodule", "global", "environment"]
+)
+def test_submodule_untracked_dirty_when_show_untracked_files_disabled(
+    git_repo: GitRepo,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+    scope: str,
+) -> None:
+    inner = tmp_path_factory.mktemp("inner")
+    subprocess.run(
+        ["git", "init", "-b", "main", str(inner)], capture_output=True, check=True
+    )
+    GitRepo(dir=str(inner)).commit_at("2026-04-10T08:00:00Z")
+    git_repo.git(
+        "-c", "protocol.file.allow=always", "submodule", "add", str(inner), "sm"
+    )
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.write_file("sm/untracked.txt")
+    if scope != "none":
+        _disable_show_untracked_files(git_repo, monkeypatch, tmp_path_factory, scope)
+    _, code = run_cmd(git_repo)
+    assert code == 2
+    out, code = run_cmd(git_repo, "--dirty", "-dirty")
+    assert code == 0
+    assert out.startswith("20260410.1-dirty.")
+
+
+@pytest.mark.parametrize("setting", ["no", "normal", "all"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param("dirty.txt", id="file"),
+        pytest.param("new/nested/dirty.txt", id="nested"),
+    ],
+)
+def test_untracked_dirty_for_each_show_untracked_files(
+    git_repo: GitRepo, setting: str, name: str
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.git("config", "status.showUntrackedFiles", setting)
+    git_repo.write_file(name)
+    _, code = run_cmd(git_repo)
+    assert code == 2
+
+
+@pytest.mark.parametrize("setting", ["no", "normal", "all"])
+def test_gitignored_not_dirty_for_each_show_untracked_files(
+    git_repo: GitRepo, setting: str
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.write_file(".gitignore", "ignored.txt\nignored-dir/\n")
+    git_repo.git("add", ".gitignore")
+    git_repo.commit_at("2026-04-10T10:00:00Z")
+    git_repo.git("config", "status.showUntrackedFiles", setting)
+    git_repo.write_file("ignored.txt")
+    git_repo.write_file("ignored-dir/nested.txt")
+    Path(git_repo.dir, "empty-dir").mkdir()
+    out, code = run_cmd(git_repo)
+    assert code == 0
+    assert out == "20260410.2"
+
+
 # --- Off-branch behavior ---
 
 
@@ -214,6 +319,18 @@ def test_off_branch_orphan_exits_3(git_repo: GitRepo) -> None:
     git_repo.commit_at("2026-04-10T10:00:00Z")
     _, code = run_cmd(git_repo, "--dirty", "-dirty")
     assert code == 3
+
+
+def test_off_branch_orphan_ignores_the_date_of_the_branch_root(
+    git_repo: GitRepo,
+) -> None:
+    git_repo.commit_at("@253402300800 +0000")
+    git_repo.git("checkout", "--orphan", "orphan")
+    git_repo.commit_at("2026-04-10T10:00:00Z")
+
+    out, code = run_cmd(git_repo, "--dirty", "-dirty")
+    assert code == 3
+    assert "cannot trace HEAD to the default branch" in out
 
 
 # --- Error cases ---
@@ -611,6 +728,20 @@ def test_utc_midnight_boundary(git_repo: GitRepo) -> None:
     assert out == "20260411.1"
 
 
+def test_reverse_dates_are_utc_in_any_time_zone(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head = git_repo.commit_at("2026-04-10T20:00:00Z")
+    east = {**os.environ, "TZ": "JST-9"}
+    local_date = "--date=format-local:%Y%m%d"
+    assert git_repo.git("log", "-1", "--format=%cd", local_date, env=east) == "20260411"
+    monkeypatch.setenv("TZ", "JST-9")
+
+    out, code = run_cmd(git_repo, "20260410.1")
+    assert code == 0
+    assert out == head
+
+
 # --- Strictly increasing versions ---
 
 
@@ -745,6 +876,145 @@ def test_reverse_short_ignores_core_abbrev(git_repo: GitRepo) -> None:
     out, code = run_cmd(git_repo, "--short", "20260410.1")
     assert code == 0
     assert len(out) == 7
+
+
+def _install_fake_gpg(repo: GitRepo) -> None:
+    fake_gpg = Path(repo.dir, ".git", "fake-gpg")
+    fake_gpg.write_text(
+        "#!/bin/sh\n"
+        "cat >/dev/null\n"
+        'case "$*" in\n'
+        "*--verify*)\n"
+        '    echo "gpg: Signature made Fri Apr 10 09:00:00 2026 UTC" >&2\n'
+        "    exit 2\n"
+        "    ;;\n"
+        "esac\n"
+        "printf '[GNUPG:] BEGIN_SIGNING\\n[GNUPG:] SIG_CREATED D 1 8 00 0 X\\n' >&2\n"
+        "printf -- '-----BEGIN PGP SIGNATURE-----\\n\\nZmFrZQ==\\n"
+        "-----END PGP SIGNATURE-----\\n'\n"
+    )
+    fake_gpg.chmod(0o755)
+    repo.git("config", "gpg.program", str(fake_gpg))
+    repo.git("config", "commit.gpgsign", "true")
+
+
+def test_reverse_ignores_log_show_signature(git_repo: GitRepo) -> None:
+    _install_fake_gpg(git_repo)
+    first = git_repo.commit_at("2026-04-10T09:00:00Z")
+    second = git_repo.commit_at("2026-04-10T10:00:00Z")
+    git_repo.git("config", "log.showSignature", "true")
+    assert "gpg: Signature made" in git_repo.git("log", "--format=%H")
+
+    out, code = run_cmd(git_repo, "20260410.1")
+    assert code == 0
+    assert out == first
+    out, code = run_cmd(git_repo, "20260410.2")
+    assert code == 0
+    assert out == second
+
+
+@pytest.mark.parametrize("key", ["i18n.logOutputEncoding", "i18n.commitEncoding"])
+def test_reverse_ignores_log_output_encoding(git_repo: GitRepo, key: str) -> None:
+    first = git_repo.commit_at("2026-04-10T09:00:00Z")
+    second = git_repo.commit_at("2026-04-10T10:00:00Z")
+    git_repo.git("config", key, "UTF-16")
+    raw = subprocess.run(
+        ["git", "log", "--format=%H"], capture_output=True, cwd=git_repo.dir, check=True
+    )
+    assert b"\0" in raw.stdout
+
+    out, code = run_cmd(git_repo, "20260410.1")
+    assert code == 0
+    assert out == first
+    out, code = run_cmd(git_repo, "20260410.2")
+    assert code == 0
+    assert out == second
+
+
+def test_reverse_ignores_inherited_log_output_encoding(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.commit_at("2026-04-10T10:00:00Z")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "i18n.logOutputEncoding")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "UTF-16")
+
+    out, code = run_cmd(git_repo, "20260410.1")
+    assert code == 0
+    assert out == first
+
+
+def test_reverse_tip_hash_as_work_tree_file(git_repo: GitRepo) -> None:
+    first = git_repo.commit_at("2026-04-10T09:00:00Z")
+    tip = git_repo.commit_at("2026-04-10T10:00:00Z")
+    git_repo.write_file(tip)
+
+    out, code = run_cmd(git_repo, "20260410.1")
+    assert code == 0
+    assert out == first
+
+
+@pytest.mark.parametrize("separator", ["\r", "\f", "\u2028"], ids=["cr", "ff", "ls"])
+def test_reverse_root_ident_resembling_parent_header(
+    git_repo: GitRepo, separator: str
+) -> None:
+    when = "2026-04-09T09:00:00Z"
+    ident = f"Mallory{separator}parent {'0' * 40}"
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": ident,
+        "GIT_AUTHOR_EMAIL": "mallory@example.com",
+        "GIT_AUTHOR_DATE": when,
+        "GIT_COMMITTER_NAME": ident,
+        "GIT_COMMITTER_EMAIL": "mallory@example.com",
+        "GIT_COMMITTER_DATE": when,
+    }
+    git_repo.git("commit", "--allow-empty", "-m", "root", env=env)
+    root = git_repo.head_hash()
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+
+    out, code = run_cmd(git_repo, "20260409.1")
+    assert code == 0
+    assert out == root
+
+
+def test_unsearchable_info_directory_is_ignored(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    info = Path(git_repo.dir, ".git", "info")
+    info.chmod(0)
+    try:
+        out, code = run_cmd(git_repo)
+    finally:
+        info.chmod(0o755)
+    assert code == 0
+    assert out == "20260410.1"
+
+
+def test_forward_tip_hash_as_work_tree_directory(git_repo: GitRepo) -> None:
+    first = git_repo.commit_at("2026-04-10T09:00:00Z")
+    tip = git_repo.commit_at("2026-04-10T10:00:00Z")
+    Path(git_repo.dir, tip).mkdir()
+
+    out, code = run_cmd(git_repo)
+    assert code == 0
+    assert out == "20260410.2"
+    out, code = run_cmd(git_repo, first)
+    assert code == 0
+    assert out == "20260410.1"
+
+
+def test_unrelated_history_hash_as_work_tree_directory_exits_3(
+    git_repo: GitRepo,
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.git("checkout", "--orphan", "orphan")
+    orphan = git_repo.commit_at("2026-04-10T10:00:00Z")
+    Path(git_repo.dir, orphan).mkdir()
+
+    out, code = run_cmd(git_repo, "--dirty", "-dirty")
+    assert code == 3
+    assert "cannot trace HEAD to the default branch" in out
 
 
 def test_dirty_hash_ignores_core_abbrev(git_repo: GitRepo) -> None:

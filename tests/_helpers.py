@@ -42,7 +42,9 @@ class GitRepo:
         return self.head_hash()
 
     def write_file(self, name: str, content: str = "dirty") -> None:
-        Path(self.dir, name).write_text(content)
+        path = Path(self.dir, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
 
     def create_branch(self, name: str) -> None:
         self.git("checkout", "-b", name)

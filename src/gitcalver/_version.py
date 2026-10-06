@@ -58,7 +58,7 @@ def _validate_repo(dir: str | None) -> _RepoState:
         raise ExitError(msg) from e
 
     graft_file = common_dir / "info" / "grafts"
-    if graft_file.exists():
+    if _git.path_exists(graft_file):
         msg = f"commit graft file is not supported: {graft_file}"
         raise IncompleteHistoryError(msg)
 
@@ -104,7 +104,7 @@ def _history_is_complete(rev: str, *, dir: str | None, state: _RepoState) -> Non
         msg = "local history ended before reachability could be proved"
         raise IncompleteHistoryError(msg) from e
 
-    if not state.shallow_file.is_file():
+    if not _git.path_is_file(state.shallow_file):
         return
 
     try:
@@ -141,6 +141,8 @@ def _find_reachable_branch_anchor(
                 "--first-parent",
                 branch_tip,
                 f"^{rev}",
+                # A work-tree path named like a revision makes it ambiguous.
+                "--",
                 dir=dir,
             )
         )
@@ -272,7 +274,7 @@ def _shallow_set(dir: str | None) -> frozenset[str]:
     except _git.GitError as e:
         msg = "cannot resolve git common directory"
         raise ExitError(msg) from e
-    if not shallow_file.is_file():
+    if not _git.path_is_file(shallow_file):
         return frozenset()
     try:
         lines = shallow_file.read_text().splitlines()
