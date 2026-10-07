@@ -3,6 +3,7 @@
 
 import argparse
 import importlib.metadata
+import io
 import sys
 from dataclasses import dataclass
 from typing import NoReturn
@@ -198,5 +199,9 @@ def main(argv: list[str] | None = None) -> NoReturn:
     if argv is None:
         argv = sys.argv[1:]
     output, code = run(argv)
+    if code == 0 and isinstance(sys.stdout, io.TextIOWrapper):
+        # An argument byte that is not valid in the locale's encoding reaches
+        # `output` as a lone surrogate, which a strict stream refuses to write.
+        sys.stdout.reconfigure(errors="surrogateescape")
     print(output, file=sys.stderr if code != 0 else sys.stdout)
     sys.exit(code)

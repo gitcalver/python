@@ -3,6 +3,7 @@
 
 import contextlib
 import datetime
+import os
 import re
 from collections import deque
 from dataclasses import dataclass
@@ -18,11 +19,11 @@ from gitcalver._errors import (
 )
 from gitcalver._format import Format, format_version
 
-VERSION_RE = re.compile(r"^(\d{8})\.([1-9]\d*)$")
+VERSION_RE = re.compile(r"(\d{8})\.([1-9]\d*)", re.ASCII)
 
 
 def is_version_string(s: str) -> bool:
-    return VERSION_RE.match(s) is not None
+    return VERSION_RE.fullmatch(s) is not None
 
 
 def _date_went_backwards(older: str, newer: str) -> ExitError:
@@ -40,6 +41,28 @@ class _RepoState:
     shallow_file: Path
     is_bare: bool
     head_hash: str
+
+
+def _check_git_arguments(*arguments: tuple[str, str | None]) -> None:
+    """Reject text that cannot be a git argument or working directory.
+
+    subprocess raises ValueError for a NUL byte and for a character that has no
+    byte encoding.
+    """
+    for what, value in arguments:
+        if value is None:
+            continue
+        try:
+            encoded = os.fsencode(value)
+        except UnicodeEncodeError as e:
+            msg = (
+                f"{what} contains a character that cannot be passed to git: "
+                f"U+{ord(e.object[e.start]):04X}"
+            )
+            raise ExitError(msg) from None
+        if b"\0" in encoded:
+            msg = f"{what} must not contain a NUL byte"
+            raise ExitError(msg)
 
 
 def _validate_repo(dir: str | None) -> _RepoState:
@@ -89,6 +112,14 @@ def _validate_repo(dir: str | None) -> _RepoState:
     )
 
 
+def _read_shallow(shallow_file: Path) -> list[str]:
+    try:
+        return _git.shallow_boundaries(shallow_file)
+    except _git.GitError as e:
+        msg = f"cannot read shallow boundary: {e}"
+        raise IncompleteHistoryError(msg) from e
+
+
 def _stored_first_parent(commit: str, *, dir: str | None) -> str | None:
     try:
         return _git.stored_first_parent(commit, dir=dir)
@@ -107,15 +138,7 @@ def _history_is_complete(rev: str, *, dir: str | None, state: _RepoState) -> Non
     if not _git.path_is_file(state.shallow_file):
         return
 
-    try:
-        boundaries = state.shallow_file.read_text().splitlines()
-    except OSError as e:
-        msg = f"cannot read shallow boundary: {e}"
-        raise IncompleteHistoryError(msg) from e
-
-    for boundary in boundaries:
-        if not boundary:
-            continue
+    for boundary in _read_shallow(state.shallow_file):
         status = _git.ancestor_status(boundary, rev, dir=dir)
         if status == 0:
             if _stored_first_parent(boundary, dir=dir) is not None:
@@ -180,6 +203,12 @@ def forward(
     branch_override: str | None,
     remote: str = "origin",
 ) -> str:
+    _check_git_arguments(
+        ("repository directory", dir),
+        ("revision", revision),
+        ("branch name", branch_override),
+        ("remote name", remote),
+    )
     state = _validate_repo(dir)
 
     is_head = revision is None
@@ -258,6 +287,9 @@ def _read_commit(
         return cached
     try:
         entry = reader.read(rev)
+    except _git.CommitFormatError as e:
+        msg = str(e)
+        raise IncompleteHistoryError(msg) from e
     except _git.GitError as e:
         msg = "local history ended before the result could be proved"
         raise IncompleteHistoryError(msg) from e
@@ -276,12 +308,7 @@ def _shallow_set(dir: str | None) -> frozenset[str]:
         raise ExitError(msg) from e
     if not _git.path_is_file(shallow_file):
         return frozenset()
-    try:
-        lines = shallow_file.read_text().splitlines()
-    except OSError as e:
-        msg = f"cannot read shallow boundary: {e}"
-        raise IncompleteHistoryError(msg) from e
-    return frozenset(line for line in lines if line)
+    return frozenset(_read_shallow(shallow_file))
 
 
 def _cohort_count(
@@ -362,15 +389,20 @@ def reverse(
     short: bool,
     remote: str = "origin",
 ) -> str:
+    _check_git_arguments(
+        ("repository directory", dir),
+        ("branch name", branch_override),
+        ("remote name", remote),
+    )
     _validate_repo(dir)
 
-    match = VERSION_RE.match(version_str)
+    match = VERSION_RE.fullmatch(version_str)
     if not match:
         msg = f"not a gitcalver version or git revision: {version_str}"
         raise ExitError(msg)
 
     date_str = match.group(1)
-    n = int(match.group(2))
+    n = match.group(2)
 
     try:
         datetime.date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:8]))
@@ -408,6 +440,9 @@ def reverse(
                         short=short,
                         dir=dir,
                     )
+    except _git.CommitFormatError as e:
+        msg = str(e)
+        raise IncompleteHistoryError(msg) from e
     except _git.GitError as e:
         msg = "local history ended before version could be proved"
         raise IncompleteHistoryError(msg) from e
@@ -429,7 +464,7 @@ def reverse(
 def _select_reverse_candidate(
     candidates: list[str],
     *,
-    n: int,
+    n: str,
     version_str: str,
     date_str: str,
     short: bool,
@@ -453,10 +488,13 @@ def _select_reverse_candidate(
             count = _cohort_count(
                 candidate, date_str, reader=reader, memo=memo, shallow=shallow
             )
-            if count == n:
+            # Decimal text, since N may have more digits than int() converts.
+            # It has no leading zeros, so length then text orders it exactly.
+            count_text = str(count)
+            if count_text == n:
                 target_hash = candidate
                 break
-            if count > n:
+            if (len(count_text), count_text) > (len(n), n):
                 break
 
     if target_hash is None:

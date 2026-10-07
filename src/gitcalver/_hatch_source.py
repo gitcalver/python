@@ -19,7 +19,7 @@ class GitCalverSource(VersionSourceInterface):
                 prefix=str(config.get("prefix", "")),
                 dirty=str(config.get("dirty", "")),
                 dirty_hash=not config.get("no-dirty-hash", False),
-                branch=config.get("branch") or None,
+                branch=str(config.get("branch") or "") or None,
                 remote=str(config.get("remote", "origin")),
                 repo=self.root,
             )

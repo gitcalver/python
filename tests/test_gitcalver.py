@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import shlex
 import shutil
@@ -25,6 +26,7 @@ from gitcalver._git import (
     git,
     is_git_repo,
     rev_list_is_complete,
+    stored_first_parent,
 )
 from gitcalver._hatch_hooks import hatch_register_version_source
 from gitcalver._hatch_source import GitCalverSource
@@ -721,6 +723,75 @@ def test_git_not_on_path(git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch) -> 
     assert "git not found" in out
 
 
+# --- Text that cannot be passed to git ---
+
+
+def _rejection(entrance: str, what: str, repo: str, text: str) -> str:
+    """Return the message `entrance` gives when only `what` is the bad `text`."""
+    directory = text if what == "repository directory" else repo
+    revision = text if what == "revision" else None
+    branch = text if what == "branch name" else None
+    remote = text if what == "remote name" else "origin"
+    if entrance == "run":
+        argv = ["--remote", remote]
+        if branch is not None:
+            argv += ["--branch", branch]
+        if revision is not None:
+            argv.append(revision)
+        out, code = run(argv, dir=directory)
+        assert code == 1
+        assert out.startswith("gitcalver: ")
+        return out.removeprefix("gitcalver: ")
+    if entrance == "hatch":
+        config = {"remote": remote}
+        if branch is not None:
+            config["branch"] = branch
+        with pytest.raises(RuntimeError) as hatch_error:
+            GitCalverSource(directory, config).get_version_data()
+        return str(hatch_error.value).removeprefix("gitcalver: ")
+
+    def call() -> str:
+        if entrance == "get_version":
+            return gitcalver.get_version(
+                revision=revision, branch=branch, remote=remote, repo=directory
+            )
+        return gitcalver.find_commit(
+            "20260410.1", branch=branch, remote=remote, repo=directory
+        )
+
+    with pytest.raises(ExitError) as exit_error:
+        call()
+    assert exit_error.value.code == 1
+    return exit_error.value.message
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        pytest.param("a\0b", "must not contain a NUL byte", id="nul"),
+        pytest.param(
+            "a\ud800b",
+            "contains a character that cannot be passed to git: U+D800",
+            id="unencodable",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("entrance", "what"),
+    [
+        (entrance, what)
+        for entrance in ("run", "get_version", "find_commit", "hatch")
+        for what in ("repository directory", "revision", "branch name", "remote name")
+        if what != "revision" or entrance in ("run", "get_version")
+    ],
+)
+def test_text_git_cannot_take_is_rejected(
+    git_repo: GitRepo, entrance: str, what: str, text: str, problem: str
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    assert _rejection(entrance, what, git_repo.dir, text) == f"{what} {problem}"
+
+
 # --- UTC midnight boundary ---
 
 
@@ -1087,6 +1158,63 @@ def test_reverse_invalid_date_day(git_repo: GitRepo) -> None:
     out, code = run_cmd(git_repo, "20260230.1")
     assert code == 1
     assert "invalid date in version" in out
+
+
+@pytest.mark.parametrize("digits", [25, 4300, 4301, 5000])
+def test_reverse_count_longer_than_any_commit_count_is_not_found(
+    git_repo: GitRepo, digits: int
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    version = f"20260410.{'9' * digits}"
+    out, code = run_cmd(git_repo, version)
+    assert code == 1
+    assert out == f"gitcalver: version not found: {version}"
+
+    with pytest.raises(ExitError, match="version not found") as raised:
+        gitcalver.find_commit(version, repo=git_repo.dir, branch="main")
+    assert raised.value.code == 1
+
+
+def test_reverse_compares_counts_numerically(git_repo: GitRepo) -> None:
+    hashes = [git_repo.commit_at(f"2026-04-10T09:{n:02}:00Z") for n in range(11)]
+    for n in (1, 2, 9, 10, 11):
+        assert run_cmd(git_repo, f"20260410.{n}") == (hashes[n - 1], 0)
+    for n in (12, 20, 100):
+        assert run_cmd(git_repo, f"20260410.{n}") == (
+            f"gitcalver: version not found: 20260410.{n}",
+            1,
+        )
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        pytest.param("20260410.1١", id="count"),
+        pytest.param("20260410.١", id="count_first_digit"),
+        pytest.param("٢٠٢٦٠٤١٠.1", id="date"),
+    ],
+)
+def test_reverse_requires_ascii_digits(git_repo: GitRepo, version: str) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    out, code = run_cmd(git_repo, version)
+    assert code == 1
+    assert out == f"gitcalver: not a gitcalver version or git revision: {version}"
+
+
+@pytest.mark.parametrize("prefix", ["", "v"], ids=["no_prefix", "prefix"])
+def test_version_followed_by_a_line_break_is_not_a_version(
+    git_repo: GitRepo, prefix: str
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    version = f"{prefix}20260410.1\n"
+
+    out, code = run_cmd(git_repo, "--prefix", prefix, version)
+    assert code == 1
+    assert out == f"gitcalver: not a gitcalver version or git revision: {version}"
+
+    with pytest.raises(ExitError, match="not a gitcalver version") as raised:
+        gitcalver.find_commit(version, prefix=prefix, repo=git_repo.dir, branch="main")
+    assert raised.value.code == 1
 
 
 # --- Forward for specific revision ---
@@ -1595,6 +1723,30 @@ def test_hatch_source_empty_branch(git_repo: GitRepo) -> None:
     assert data["version"] == "20260410.1"
 
 
+@pytest.mark.parametrize(
+    "config",
+    [{}, {"branch": 0}, {"branch": False}, {"branch": []}],
+    ids=["absent", "zero", "false", "empty_list"],
+)
+def test_hatch_source_absent_or_falsy_branch_autodetects(
+    git_repo: GitRepo, config: dict[str, object]
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    source = GitCalverSource(git_repo.dir, config)
+    assert source.get_version_data()["version"] == "20260410.1"
+
+
+@pytest.mark.parametrize("branch", [5, ["main"], True], ids=["int", "list", "bool"])
+def test_hatch_source_non_string_branch_is_reported(
+    git_repo: GitRepo, branch: object
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    source = GitCalverSource(git_repo.dir, {"branch": branch})
+    with pytest.raises(RuntimeError) as raised:
+        source.get_version_data()
+    assert str(raised.value) == f"gitcalver: branch not found: {branch}"
+
+
 def test_hatch_hooks() -> None:
     cls = hatch_register_version_source()
     assert cls is GitCalverSource
@@ -1795,6 +1947,30 @@ def test_cli_main_success(
         main(["--branch", "main"])
     assert exc_info.value.code == 0
     assert capsys.readouterr().out.strip() == "20260410.1"
+
+
+@pytest.mark.parametrize("option", ["prefix", "dirty"])
+def test_cli_writes_non_utf8_argument_bytes_as_given(
+    git_repo: GitRepo, option: str
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    if option == "prefix":
+        args = [b"--prefix=\xff"]
+        want = b"\xff20260410.1\n"
+    else:
+        git_repo.write_file("dirty.txt")
+        args = [b"--dirty=\xff", "--no-dirty-hash"]
+        want = b"20260410.1\xff\n"
+    result = subprocess.run(
+        [sys.executable, "-m", "gitcalver", "--branch", "main", *args],
+        capture_output=True,
+        cwd=git_repo.dir,
+        env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8:strict"},
+        check=False,
+    )
+    assert result.stderr == b""
+    assert result.stdout == want
+    assert result.returncode == 0
 
 
 def test_cli_main_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2080,6 +2256,446 @@ def test_shallow_clone_with_older_date_boundary_succeeds(tmp_path: Path) -> None
     out, code = run_cmd(clone)
     assert code == 0
     assert out == "20260410.1"
+
+
+# --- Shallow cuts that a stored parent proves are not roots ---
+
+
+def _origin(tmp_path: Path) -> GitRepo:
+    origin_dir = str(tmp_path / "origin")
+    subprocess.run(
+        ["git", "init", "-b", "main", origin_dir],
+        capture_output=True,
+        check=True,
+    )
+    return GitRepo(dir=origin_dir)
+
+
+def _clone(tmp_path: Path, origin: GitRepo, *options: str) -> GitRepo:
+    clone_dir = str(tmp_path / "clone")
+    subprocess.run(
+        ["git", "clone", *options, f"file://{origin.dir}", clone_dir],
+        capture_output=True,
+        check=True,
+    )
+    return GitRepo(dir=clone_dir)
+
+
+def test_reverse_older_date_in_shallow_clone_exits_4(tmp_path: Path) -> None:
+    origin = _origin(tmp_path)
+    origin.commit_at("2026-04-09T09:00:00Z")
+    origin.commit_at("2026-04-10T09:00:00Z")
+    clone = _clone(tmp_path, origin, "--depth", "1")
+
+    # The clone's only commit stores the 2026-04-09 commit as its parent, so
+    # the log ending there does not show that 20260409.1 never existed.
+    assert run_cmd(clone, "20260409.1") == (
+        "gitcalver: local history ended before version could be proved",
+        4,
+    )
+
+
+def test_unrelated_target_cut_by_shallow_boundary_exits_4(tmp_path: Path) -> None:
+    origin = _origin(tmp_path)
+    origin.commit_at("2026-04-10T08:00:00Z")  # main's only commit
+    origin.git("checkout", "--orphan", "other")
+    origin.commit_at("2026-04-10T09:00:00Z")  # other's root
+    origin.commit_at("2026-04-10T10:00:00Z")  # the boundary of a depth-2 clone
+    target = origin.commit_at("2026-04-10T11:00:00Z")
+    origin.checkout("main")
+    clone = _clone(tmp_path, origin, "--depth", "2", "--no-single-branch")
+
+    # The boundary stores the root as its parent, and the root may connect to
+    # main.
+    assert run_cmd(clone, target) == (
+        "gitcalver: local history ended before reachability could be proved",
+        4,
+    )
+
+
+def test_unrelated_target_with_shallow_roots_exits_3(tmp_path: Path) -> None:
+    origin = _origin(tmp_path)
+    origin.commit_at("2026-04-10T09:00:00Z")  # main's only commit
+    origin.git("checkout", "--orphan", "other")
+    target = origin.commit_at("2026-04-10T10:00:00Z")  # other's only commit
+    origin.checkout("main")
+    clone = _clone(tmp_path, origin, "--depth", "1", "--no-single-branch")
+
+    # Depth 1 lists both roots as shallow boundaries, but a boundary with no
+    # stored parent hides nothing.
+    assert len(Path(clone.dir, ".git", "shallow").read_text().split()) == 2
+    assert run_cmd(clone, target) == (
+        f"gitcalver: cannot trace {target} to the default branch (main)",
+        3,
+    )
+
+
+def test_shallow_branch_cannot_prove_unrelated_target_exits_4(tmp_path: Path) -> None:
+    origin = _origin(tmp_path)
+    origin.commit_at("2026-04-10T09:00:00Z")
+    origin.commit_at("2026-04-10T10:00:00Z")
+    origin.commit_at("2026-04-10T11:00:00Z")  # main's tip
+    origin.git("checkout", "--orphan", "other")
+    target = origin.commit_at("2026-04-10T12:00:00Z")  # other's only commit
+    origin.checkout("main")
+    clone = _clone(tmp_path, origin, "--depth", "1", "--no-single-branch")
+
+    # The tip is main's oldest local commit but stores its parent, so main may
+    # reach the target through it.
+    assert run_cmd(clone, target) == (
+        "gitcalver: local history cannot prove the target's branch relationship",
+        4,
+    )
+
+
+def test_unrelated_target_with_missing_shallow_boundary_exits_4(
+    git_repo: GitRepo,
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.git("checkout", "--orphan", "other")
+    target = git_repo.commit_at("2026-04-10T10:00:00Z")
+    git_repo.checkout("main")
+    Path(git_repo.dir, ".git", "shallow").write_text("1" * len(target) + "\n")
+
+    assert run_cmd(git_repo, target) == (
+        "gitcalver: local history ended before reachability could be proved",
+        4,
+    )
+
+
+def test_stored_first_parent_returns_the_first_parent(git_repo: GitRepo) -> None:
+    root = git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.create_branch("feature")
+    git_repo.commit_at("2026-04-10T10:00:00Z")
+    git_repo.checkout("main")
+    main = git_repo.commit_at("2026-04-10T11:00:00Z")
+    git_repo.merge("feature", "2026-04-10T12:00:00Z")
+    merge = git_repo.head_hash()
+
+    assert stored_first_parent(root, dir=git_repo.dir) is None
+    assert stored_first_parent(main, dir=git_repo.dir) == root
+    assert stored_first_parent(merge, dir=git_repo.dir) == main
+
+
+def test_reverse_root_message_resembling_parent_header(git_repo: GitRepo) -> None:
+    root = git_repo.commit_at(
+        "2026-04-09T09:00:00Z", message=f"root\n\nparent {'0' * 40}"
+    )
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+
+    assert run_cmd(git_repo, "20260409.1") == (root, 0)
+
+
+# --- Shallow files and commit objects that cannot be read ---
+
+
+def _linear_history(repo: GitRepo) -> tuple[str, str]:
+    root = repo.commit_at("2026-04-10T09:00:00Z")
+    middle = repo.commit_at("2026-04-10T10:00:00Z")
+    repo.commit_at("2026-04-10T11:00:00Z")
+    return root, middle
+
+
+# Git reads only the object ID at the start of a line, so it accepts these.
+_BAD_SHALLOW_LINES = [
+    pytest.param(b"{oid}\xff", id="non_utf8"),
+    pytest.param(b"{oid} junk", id="trailing_text"),
+    pytest.param(b"{oid}\0junk", id="nul"),
+    pytest.param(b"{oid}\x0cjunk", id="form_feed"),
+]
+
+
+def _shallow_message(shallow: Path) -> str:
+    return (
+        f"gitcalver: cannot read shallow boundary: {shallow}: "
+        "line 1 is not an object ID: "
+    )
+
+
+@pytest.mark.parametrize("line", _BAD_SHALLOW_LINES)
+@pytest.mark.parametrize("target", [[], ["20260410.2"]], ids=["forward", "reverse"])
+def test_malformed_shallow_line_exits_4(
+    git_repo: GitRepo, line: bytes, target: list[str]
+) -> None:
+    root, _ = _linear_history(git_repo)
+    shallow = Path(git_repo.dir, ".git", "shallow")
+    shallow.write_bytes(line.replace(b"{oid}", root.encode()) + b"\n")
+
+    out, code = run_cmd(git_repo, *target)
+    assert code == 4
+    assert out.startswith(_shallow_message(shallow))
+
+
+@pytest.mark.parametrize("line", _BAD_SHALLOW_LINES)
+def test_malformed_shallow_line_is_reported_when_proving_unrelated_history(
+    git_repo: GitRepo, line: bytes
+) -> None:
+    root = git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.git("checkout", "--orphan", "orphan")
+    git_repo.commit_at("2026-04-10T10:00:00Z")
+    shallow = Path(git_repo.dir, ".git", "shallow")
+    shallow.write_bytes(line.replace(b"{oid}", root.encode()) + b"\n")
+
+    out, code = run_cmd(git_repo, "--dirty", "-dirty")
+    assert code == 4
+    assert out.startswith(_shallow_message(shallow))
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(b"{root}\n", id="lf"),
+        pytest.param(b"{root}", id="no_final_newline"),
+        pytest.param(b"{root}\r\n", id="crlf"),
+        pytest.param(b"", id="empty"),
+    ],
+)
+def test_shallow_file_forms_git_writes_or_reads_are_accepted(
+    git_repo: GitRepo, content: bytes
+) -> None:
+    root, _ = _linear_history(git_repo)
+    Path(git_repo.dir, ".git", "shallow").write_bytes(
+        content.replace(b"{root}", root.encode())
+    )
+
+    assert run_cmd(git_repo) == ("20260410.3", 0)
+
+
+@pytest.mark.parametrize("case", ["lower", "upper"])
+def test_shallow_boundary_is_matched_whatever_the_case(
+    git_repo: GitRepo, case: str
+) -> None:
+    _, middle = _linear_history(git_repo)
+    name = middle.upper() if case == "upper" else middle
+    Path(git_repo.dir, ".git", "shallow").write_text(f"{name}\n")
+
+    out, code = run_cmd(git_repo)
+    assert code == 4
+    assert out == "gitcalver: local history ended inside the 20260410 date block"
+
+
+def test_unreadable_shallow_file_exits_4(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _linear_history(git_repo)
+    Path(git_repo.dir, ".git", "shallow").write_text(f"{root}\n")
+    read_bytes = Path.read_bytes
+
+    # Mode bits cannot make the file unreadable to root or on a filesystem that
+    # ignores them, so the read is refused here.
+    def refuse(path: Path) -> bytes:
+        if path.name == "shallow":
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path))
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+
+    out, code = run_cmd(git_repo)
+    assert code == 4
+    assert out.startswith(
+        "gitcalver: cannot read shallow boundary: [Errno 13] Permission denied: "
+    )
+
+
+_AUTHOR = b"author Test <test@test.com> 1775813400 +0000"
+_COMMITTER = b"committer Test <test@test.com> 1775813400 +0000"
+
+
+def _write_commit(repo: GitRepo, *headers: bytes) -> str:
+    # --literally stores objects that git would refuse to write.
+    result = subprocess.run(
+        ["git", "hash-object", "-t", "commit", "-w", "--literally", "--stdin"],
+        capture_output=True,
+        cwd=repo.dir,
+        input=b"\n".join([*headers, b"", b"message"]),
+        check=True,
+    )
+    return result.stdout.decode().strip()
+
+
+def _merge_with_second_parent(repo: GitRepo, *headers: bytes) -> str:
+    """Make HEAD a merge of two parents; return the second, built from `headers`.
+
+    Git never parses a second parent while it walks first parents, so only
+    gitcalver's own reader meets it.
+    """
+    base = repo.commit_at("2026-04-10T09:00:00Z")
+    tree = b"tree " + repo.git("rev-parse", "HEAD^{tree}").encode()
+    side = _write_commit(repo, tree, *headers)
+    merge = _write_commit(
+        repo,
+        tree,
+        f"parent {base}".encode(),
+        f"parent {side}".encode(),
+        _AUTHOR,
+        _COMMITTER,
+    )
+    repo.git("update-ref", "refs/heads/main", merge)
+    return side
+
+
+@pytest.mark.parametrize(
+    ("headers", "problem"),
+    [
+        pytest.param(
+            [_AUTHOR],
+            "has no committer line",
+            id="no_committer",
+        ),
+        pytest.param(
+            [_AUTHOR, b"committer x"],
+            "has no committer date between the years 1 and 9999",
+            id="committer_without_timestamp",
+        ),
+        pytest.param(
+            [_AUTHOR, b"committer Test <test@test.com> abc +0000"],
+            "has no committer date between the years 1 and 9999",
+            id="timestamp_not_a_number",
+        ),
+        pytest.param(
+            [_AUTHOR, b"committer Test <test@test.com> 1775813400"],
+            "has no committer date between the years 1 and 9999",
+            id="timezone_missing",
+        ),
+        pytest.param(
+            [_AUTHOR, b"committer Test <test@test.com> 1775813400 +0000 extra"],
+            "has no committer date between the years 1 and 9999",
+            id="text_after_timezone",
+        ),
+        pytest.param(
+            [_AUTHOR, b"committer Test <test@test.com> " + b"9" * 20 + b" +0000"],
+            "has no committer date between the years 1 and 9999",
+            id="timestamp_too_long",
+        ),
+        pytest.param(
+            [_AUTHOR, b"committer Test <test@test.com> " + b"9" * 5000 + b" +0000"],
+            "has no committer date between the years 1 and 9999",
+            id="timestamp_beyond_int_conversion_limit",
+        ),
+        pytest.param(
+            [_AUTHOR, b"committer Test <test@test.com> 253402300800 +0000"],
+            "has no committer date between the years 1 and 9999",
+            id="year_10000",
+        ),
+        pytest.param(
+            [_AUTHOR, b"committer Test <test@test.com> -62135596801 +0000"],
+            "has no committer date between the years 1 and 9999",
+            id="year_0",
+        ),
+        pytest.param(
+            [b"parent \xff\xfe", _AUTHOR, _COMMITTER],
+            "has a parent line that is not an object ID",
+            id="parent_non_utf8",
+        ),
+        pytest.param(
+            [b"parent zzzz", _AUTHOR, _COMMITTER],
+            "has a parent line that is not an object ID",
+            id="parent_not_hex",
+        ),
+    ],
+)
+@pytest.mark.parametrize("target", [[], ["20260410.2"]], ids=["forward", "reverse"])
+def test_unreadable_commit_object_exits_4(
+    git_repo: GitRepo, headers: list[bytes], problem: str, target: list[str]
+) -> None:
+    side = _merge_with_second_parent(git_repo, *headers)
+
+    assert run_cmd(git_repo, *target) == (f"gitcalver: commit {side} {problem}", 4)
+
+
+@pytest.mark.parametrize(
+    ("committer", "want"),
+    [
+        pytest.param(
+            b"253402300799",
+            (
+                "gitcalver: committer date not monotonic: older commit dated "
+                "99991231 has a later date than newer commit dated 20260410",
+                1,
+            ),
+            id="last_second_of_9999",
+        ),
+        pytest.param(b"-62135596800", ("20260410.2", 0), id="first_second_of_year_1"),
+        pytest.param(b"-30627460800", ("20260410.2", 0), id="three_digit_year"),
+        pytest.param(b"-1", ("20260410.2", 0), id="before_1970"),
+    ],
+)
+def test_committer_dates_at_the_edges_are_read(
+    git_repo: GitRepo, committer: bytes, want: tuple[str, int]
+) -> None:
+    _merge_with_second_parent(
+        git_repo,
+        _AUTHOR,
+        b"committer Test <test@test.com> " + committer + b" +0000",
+    )
+
+    assert run_cmd(git_repo) == want
+
+
+def _commit_on_top(repo: GitRepo, committer: bytes) -> str:
+    base = repo.commit_at("2026-04-10T09:00:00Z")
+    tree = b"tree " + repo.git("rev-parse", "HEAD^{tree}").encode()
+    tip = _write_commit(
+        repo,
+        tree,
+        f"parent {base}".encode(),
+        _AUTHOR,
+        b"committer Test <test@test.com> " + committer + b" +0000",
+    )
+    repo.git("update-ref", "refs/heads/main", tip)
+    return tip
+
+
+@pytest.mark.parametrize(
+    "committer",
+    [
+        pytest.param(b"253402300800", id="year_10000"),
+        pytest.param(b"abc", id="not_a_number"),
+        pytest.param(b"-1", id="before_1970"),
+    ],
+)
+def test_reverse_refuses_a_first_parent_commit_without_a_date_it_can_use(
+    git_repo: GitRepo, committer: bytes
+) -> None:
+    tip = _commit_on_top(git_repo, committer)
+
+    assert run_cmd(git_repo, "20260410.1") == (
+        f"gitcalver: git log printed no YYYYMMDD committer date for {tip}",
+        4,
+    )
+
+
+def test_reverse_refuses_a_root_without_a_date_it_can_use(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    tree = b"tree " + git_repo.git("rev-parse", "HEAD^{tree}").encode()
+    root = _write_commit(
+        git_repo, tree, _AUTHOR, b"committer Test <test@test.com> -1 +0000"
+    )
+    tip = _write_commit(git_repo, tree, f"parent {root}".encode(), _AUTHOR, _COMMITTER)
+    git_repo.git("update-ref", "refs/heads/main", tip)
+    assert run_cmd(git_repo) == ("20260410.1", 0)
+
+    assert run_cmd(git_repo, "20260410.1") == (
+        f"gitcalver: git log printed no YYYYMMDD committer date for {root}",
+        4,
+    )
+
+
+def test_parent_ids_are_compared_in_lowercase(git_repo: GitRepo) -> None:
+    base = git_repo.commit_at("2026-04-10T09:00:00Z")
+    tree = b"tree " + git_repo.git("rev-parse", "HEAD^{tree}").encode()
+    merge = _write_commit(
+        git_repo,
+        tree,
+        f"parent {base}".encode(),
+        f"parent {base.upper()}".encode(),
+        _AUTHOR,
+        _COMMITTER,
+    )
+    git_repo.git("update-ref", "refs/heads/main", merge)
+    assert git_repo.git("rev-list", "--count", "HEAD") == "2"
+
+    assert run_cmd(git_repo) == ("20260410.2", 0)
 
 
 # --- Partial clone accepted ---
@@ -2459,6 +3075,33 @@ def test_unintelligible_answer_does_not_make_close_wait_for_the_child(
     reader.close()
 
     assert _child(reader).returncode == -signal.SIGKILL
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param("abc commit 12", id="header_without_newline"),
+        pytest.param("abc commit 100\\ncommitter Bob 99 Smith", id="body_cut_short"),
+        pytest.param("abc commit 5\\nhello?", id="body_without_final_newline"),
+    ],
+)
+def test_answer_that_ends_early_is_not_parsed(
+    git_repo: GitRepo,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    answer: str,
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    _fake_cat_file(
+        tmp_path_factory.mktemp("shim"),
+        monkeypatch,
+        f"read request\nprintf '{answer}'\nexit 0",
+    )
+
+    assert run_cmd(git_repo) == (
+        "gitcalver: local history ended before the result could be proved",
+        4,
+    )
 
 
 def test_interrupted_read_does_not_make_close_wait_for_the_child(

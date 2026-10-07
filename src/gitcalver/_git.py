@@ -3,6 +3,7 @@
 
 import datetime
 import os
+import re
 import subprocess
 from collections.abc import Generator
 from pathlib import Path
@@ -12,8 +13,22 @@ class GitError(Exception):
     pass
 
 
+class CommitFormatError(GitError):
+    """A commit object that git returned cannot be read."""
+
+
 _HASH_PREFIX_LEN = 7
 _GIT_DIE_STATUS = 128
+_UTC = datetime.timezone.utc
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=_UTC)
+_SECOND = datetime.timedelta(seconds=1)
+_MIN_EPOCH = (datetime.datetime.min.replace(tzinfo=_UTC) - _EPOCH) // _SECOND
+_MAX_EPOCH = (datetime.datetime.max.replace(tzinfo=_UTC) - _EPOCH) // _SECOND
+_OBJECT_ID = re.compile(rb"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?")
+# More than 15 digits cannot be a date before the year 10000, and the cap keeps
+# int() clear of its digit-string conversion limit.
+_COMMITTER_EPOCH = re.compile(rb" (-?[0-9]{1,15}) [^ ]*\Z")
+_LOG_DATE = re.compile(r"[0-9]{8}")
 
 
 def _os_error_message(e: OSError) -> str:
@@ -188,6 +203,29 @@ def object_exists(object_spec: str, dir: str | None = None) -> bool:
     return git_ok("cat-file", "-e", object_spec, dir=dir)
 
 
+def shallow_boundaries(shallow_file: Path) -> list[str]:
+    """Return the lowercase object IDs listed in `shallow_file`.
+
+    Raise GitError if the file cannot be read or a line is not an object ID.
+    Git accepts text after the ID, but no writer produces it, and a boundary
+    the walk cannot match would pass for a complete history.
+    """
+    try:
+        data = shallow_file.read_bytes()
+    except OSError as e:
+        raise GitError(str(e)) from e
+    boundaries: list[str] = []
+    for number, raw in enumerate(data.split(b"\n"), start=1):
+        line = raw.removesuffix(b"\r")
+        if not line:
+            continue
+        if _OBJECT_ID.fullmatch(line) is None:
+            msg = f"{shallow_file}: line {number} is not an object ID: {line[:80]!r}"
+            raise GitError(msg)
+        boundaries.append(line.decode("ascii").lower())
+    return boundaries
+
+
 def stored_first_parent(commit: str, dir: str | None = None) -> str | None:
     # Bytes, split on newlines only. As text, CR would be translated to a line
     # break and str.splitlines() would also break at FF and U+2028, so an ident
@@ -265,9 +303,14 @@ def first_parent_log(
         if proc.stdout is None:
             return
         for line in proc.stdout:
-            hash_, _, date = line.strip().partition(" ")
-            if date:
-                yield hash_, date
+            hash_, _, date = line.rstrip("\n").partition(" ")
+            # git prints an empty date for a negative or unparsable stamp and more
+            # than eight digits from year 10000; string order is date order only
+            # for eight digits.
+            if _LOG_DATE.fullmatch(date) is None:
+                msg = f"git log printed no YYYYMMDD committer date for {hash_}"
+                raise CommitFormatError(msg)
+            yield hash_, date
         returncode = proc.wait()
         if returncode != 0:
             msg = f"git log {rev} failed"
@@ -332,9 +375,10 @@ class CommitReader:
 
         One request and exactly one response per call, so the pipe cannot
         deadlock. The date is derived from the committer epoch seconds,
-        ignoring the stored timezone offset. After a call raises, every later
-        call raises GitError: the pipe may still hold the failed request's
-        response, which would answer the next request.
+        ignoring the stored timezone offset. Raise CommitFormatError if the
+        commit's parents or committer date cannot be read. After a call raises,
+        every later call raises GitError: the pipe may still hold the failed
+        request's response, which would answer the next request.
         """
         if self._broken:
             msg = "git cat-file pipe is out of step after a failed read"
@@ -356,30 +400,50 @@ class CommitReader:
             header = proc.stdout.readline()
         except OSError as e:
             raise GitError(str(e)) from e
+        if not header.endswith(b"\n"):
+            msg = f"git cat-file ended its answer for {rev} early"
+            raise GitError(msg)
         match header.split():
             case [_, b"missing" | b"ambiguous"]:
                 return None
-            case [oid_field, b"commit", size_field]:
+            case [oid_field, b"commit", size_field] if size_field.isdigit():
                 oid = oid_field.decode()
                 size = int(size_field)
             case _:
                 msg = f"unexpected cat-file response for {rev}"
                 raise GitError(msg)
-        body = proc.stdout.read(size + 1)[:size]
+        # The object is followed by a newline; a child that dies mid-answer
+        # leaves less, and a cut inside the committer line must not read as a
+        # date.
+        data = proc.stdout.read(size + 1)
+        if len(data) != size + 1 or not data.endswith(b"\n"):
+            msg = f"git cat-file ended its answer for {rev} early"
+            raise GitError(msg)
+        body = data[:size]
         parents: list[str] = []
-        committer_epoch: int | None = None
+        committer: bytes | None = None
         for line in body.split(b"\n"):
             if not line:
                 break
             key, _, value = line.partition(b" ")
             if key == b"parent":
-                parents.append(value.decode())
+                if _OBJECT_ID.fullmatch(value) is None:
+                    msg = f"commit {oid} has a parent line that is not an object ID"
+                    raise CommitFormatError(msg)
+                parents.append(value.decode("ascii").lower())
             elif key == b"committer":
-                committer_epoch = int(value.rsplit(b" ", 2)[-2])
-        if committer_epoch is None:
-            msg = f"cannot parse commit {oid}"
-            raise GitError(msg)
-        date = datetime.datetime.fromtimestamp(
-            committer_epoch, datetime.timezone.utc
-        ).strftime("%Y%m%d")
-        return oid, parents, date
+                committer = value
+        if committer is None:
+            msg = f"commit {oid} has no committer line"
+            raise CommitFormatError(msg)
+        return oid, parents, _committer_date(oid, committer)
+
+
+def _committer_date(oid: str, committer: bytes) -> str:
+    match = _COMMITTER_EPOCH.search(committer)
+    epoch = int(match[1]) if match else None
+    if epoch is None or not _MIN_EPOCH <= epoch <= _MAX_EPOCH:
+        msg = f"commit {oid} has no committer date between the years 1 and 9999"
+        raise CommitFormatError(msg)
+    date = _EPOCH + datetime.timedelta(seconds=epoch)
+    return f"{date.year:04}{date.month:02}{date.day:02}"

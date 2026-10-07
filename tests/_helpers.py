@@ -32,13 +32,19 @@ class GitRepo:
             raise RuntimeError(msg)
         return result.stdout.strip()
 
-    def commit_at(self, date_str: str, *, committer_date: str | None = None) -> str:
+    def commit_at(
+        self,
+        date_str: str,
+        *,
+        committer_date: str | None = None,
+        message: str = "commit",
+    ) -> str:
         env = {
             **self._env,
             "GIT_AUTHOR_DATE": date_str,
             "GIT_COMMITTER_DATE": committer_date or date_str,
         }
-        self.git("commit", "--allow-empty", "-m", "commit", env=env)
+        self.git("commit", "--allow-empty", "-m", message, env=env)
         return self.head_hash()
 
     def write_file(self, name: str, content: str = "dirty") -> None:
