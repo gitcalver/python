@@ -297,22 +297,55 @@ class CommitReader:
             )
         except OSError as e:
             raise GitError(_os_error_message(e)) from e
+        # A failed read may leave the pipe out of step with a child that is
+        # dead, stuck or midway through a response, and a stuck child may
+        # never act on EOF, so read() refuses further requests and close()
+        # kills the child.
+        self._broken = False
 
     def close(self) -> None:
         proc = self._proc
-        if proc.stdin is not None:
-            proc.stdin.close()
-        if proc.stdout is not None:
-            proc.stdout.close()
-        proc.wait()
+        if self._broken:
+            proc.kill()
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        finally:
+            try:
+                self._close_stdin()
+            finally:
+                proc.wait()
+
+    def _close_stdin(self) -> None:
+        if self._proc.stdin is None:
+            return
+        try:
+            self._proc.stdin.close()
+        except BrokenPipeError:
+            # A request that read() failed to deliver is still buffered and
+            # flushes again here; read() has already reported that failure.
+            if not self._broken:
+                raise
 
     def read(self, rev: str) -> tuple[str, list[str], str] | None:
         """Return (oid, parent oids, UTC committer date) or None if absent.
 
         One request and exactly one response per call, so the pipe cannot
         deadlock. The date is derived from the committer epoch seconds,
-        ignoring the stored timezone offset.
+        ignoring the stored timezone offset. After a call raises, every later
+        call raises GitError: the pipe may still hold the failed request's
+        response, which would answer the next request.
         """
+        if self._broken:
+            msg = "git cat-file pipe is out of step after a failed read"
+            raise GitError(msg)
+        try:
+            return self._read(rev)
+        except BaseException:
+            self._broken = True
+            raise
+
+    def _read(self, rev: str) -> tuple[str, list[str], str] | None:
         proc = self._proc
         if proc.stdin is None or proc.stdout is None or proc.poll() is not None:
             msg = "git cat-file exited unexpectedly"

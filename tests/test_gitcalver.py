@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -16,6 +19,7 @@ import gitcalver
 from gitcalver._branch import detect_branch
 from gitcalver._errors import ExitError, IncompleteHistoryError
 from gitcalver._git import (
+    CommitReader,
     GitError,
     _looks_like_repository,
     git,
@@ -2307,3 +2311,289 @@ def test_unreadable_head_reports_cannot_read_head(
     out, code = run_cmd(git_repo)
     assert code == 1
     assert out == f"gitcalver: cannot read HEAD: {tail}"
+
+
+# --- A git cat-file child that stops cooperating ---
+
+
+def _fake_cat_file(bin_dir: Path, monkeypatch: pytest.MonkeyPatch, script: str) -> None:
+    real_git = shutil.which("git")
+    assert real_git
+    fake_git = bin_dir / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        f"real={shlex.quote(real_git)}\n"
+        'if [ "$*" = "cat-file --batch" ]; then\n'
+        f"{script}\n"
+        "fi\n"
+        'exec "$real" "$@"\n'
+    )
+    fake_git.chmod(0o755)
+    assert os.access(fake_git, os.X_OK), "tmp_path is on a noexec filesystem"
+    monkeypatch.setenv("PATH", str(bin_dir), prepend=os.pathsep)
+
+
+def _child(reader: CommitReader) -> subprocess.Popen[bytes]:
+    return reader._proc  # noqa: SLF001
+
+
+def _wait_for(path: Path) -> None:
+    deadline = time.monotonic() + 30
+    while not path.exists():
+        assert time.monotonic() < deadline, f"{path.name} never appeared"
+        time.sleep(0.01)
+
+
+def _interrupt() -> bytes:
+    raise KeyboardInterrupt
+
+
+def _fail_after_closing(
+    monkeypatch: pytest.MonkeyPatch, proc: subprocess.Popen[bytes], pipe: str
+) -> None:
+    stream = getattr(proc, pipe)
+    close = stream.close
+
+    def close_and_fail() -> None:
+        close()
+        msg = "cannot close"
+        raise OSError(msg)
+
+    monkeypatch.setattr(stream, "close", close_and_fail)
+
+
+# A fake child that sleeps stays alive for 30 seconds unless it is killed, so a
+# close() that waits for it to exit by itself takes that long.
+SLEEP = "exec sleep 30"
+
+
+def _closes_stdin_then(script: str, ready: Path) -> str:
+    return f"exec <&-\n: >{shlex.quote(str(ready))}\n{script}"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param([], id="forward"),
+        pytest.param(["20260410.3"], id="reverse"),
+    ],
+)
+def test_a_child_that_stops_reading_does_not_replace_the_error(
+    git_repo: GitRepo,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+) -> None:
+    for hour in ("09", "10", "11"):
+        git_repo.commit_at(f"2026-04-10T{hour}:00:00Z")
+    scratch = tmp_path_factory.mktemp("scratch")
+    answer = shlex.quote(str(scratch / "answer"))
+    # Answer the first request with its stdin already closed, so the parent's
+    # second request meets a pipe nobody reads, and stay alive.
+    _fake_cat_file(
+        tmp_path_factory.mktemp("shim"),
+        monkeypatch,
+        "read request\n"
+        f'printf "%s\\n" "$request" | "$real" cat-file --batch >{answer}\n'
+        "exec <&-\n"
+        f"cat {answer}\n"
+        f"{SLEEP}",
+    )
+    readers: list[CommitReader] = []
+    init = CommitReader.__init__
+
+    def record(self: CommitReader, dir: str | None = None) -> None:
+        init(self, dir=dir)
+        readers.append(self)
+
+    monkeypatch.setattr(CommitReader, "__init__", record)
+
+    out, code = run_cmd(git_repo, *args)
+
+    assert code == 4
+    assert out == "gitcalver: local history ended before the result could be proved"
+    assert [_child(reader).returncode for reader in readers] == [-signal.SIGKILL]
+
+
+def test_failed_request_is_reported_and_the_child_is_killed(
+    git_repo: GitRepo,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = tmp_path_factory.mktemp("scratch") / "ready"
+    _fake_cat_file(
+        tmp_path_factory.mktemp("shim"),
+        monkeypatch,
+        _closes_stdin_then(SLEEP, ready),
+    )
+    reader = CommitReader(dir=git_repo.dir)
+    _wait_for(ready)
+
+    with pytest.raises(GitError) as raised:
+        reader.read("HEAD")
+    assert isinstance(raised.value.__cause__, BrokenPipeError)
+    reader.close()
+
+    proc = _child(reader)
+    assert proc.returncode == -signal.SIGKILL
+    assert proc.stdin is not None
+    assert proc.stdin.closed
+    assert proc.stdout is not None
+    assert proc.stdout.closed
+
+
+def test_unintelligible_answer_does_not_make_close_wait_for_the_child(
+    git_repo: GitRepo,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_cat_file(
+        tmp_path_factory.mktemp("shim"),
+        monkeypatch,
+        f"read request\necho garbage\n{SLEEP}",
+    )
+    reader = CommitReader(dir=git_repo.dir)
+
+    with pytest.raises(GitError, match="unexpected cat-file response"):
+        reader.read("HEAD")
+    reader.close()
+
+    assert _child(reader).returncode == -signal.SIGKILL
+
+
+def test_interrupted_read_does_not_make_close_wait_for_the_child(
+    git_repo: GitRepo,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_cat_file(tmp_path_factory.mktemp("shim"), monkeypatch, SLEEP)
+    reader = CommitReader(dir=git_repo.dir)
+    proc = _child(reader)
+    assert proc.stdout is not None
+    monkeypatch.setattr(proc.stdout, "readline", _interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        reader.read("HEAD")
+    reader.close()
+
+    assert proc.returncode == -signal.SIGKILL
+
+
+def test_failed_reader_refuses_further_reads(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = git_repo.commit_at("2026-04-10T09:00:00Z")
+    second = git_repo.commit_at("2026-04-10T10:00:00Z")
+    reader = CommitReader(dir=git_repo.dir)
+    proc = _child(reader)
+    assert proc.stdout is not None
+    readline = proc.stdout.readline
+    calls = 0
+
+    def interrupt_first_call() -> bytes:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyboardInterrupt
+        return readline()
+
+    monkeypatch.setattr(proc.stdout, "readline", interrupt_first_call)
+
+    with pytest.raises(KeyboardInterrupt):
+        reader.read(second)
+    with pytest.raises(GitError, match="out of step"):
+        reader.read(first)
+    reader.close()
+
+    assert proc.returncode == -signal.SIGKILL
+
+
+def test_close_surfaces_a_broken_pipe_that_no_failed_request_explains(
+    git_repo: GitRepo,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = tmp_path_factory.mktemp("scratch") / "ready"
+    _fake_cat_file(
+        tmp_path_factory.mktemp("shim"),
+        monkeypatch,
+        _closes_stdin_then("exit 0", ready),
+    )
+    reader = CommitReader(dir=git_repo.dir)
+    proc = _child(reader)
+    assert proc.stdin is not None
+    _wait_for(ready)
+    proc.stdin.write(b"never flushed\n")
+
+    with pytest.raises(BrokenPipeError):
+        reader.close()
+
+    assert proc.stdin.closed
+    assert proc.stdout is not None
+    assert proc.stdout.closed
+    assert proc.returncode == 0
+
+
+def test_close_after_a_failed_exchange_still_surfaces_other_errors(
+    git_repo: GitRepo,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_cat_file(
+        tmp_path_factory.mktemp("shim"),
+        monkeypatch,
+        f"read request\necho garbage\n{SLEEP}",
+    )
+    reader = CommitReader(dir=git_repo.dir)
+    with pytest.raises(GitError):
+        reader.read("HEAD")
+    proc = _child(reader)
+    _fail_after_closing(monkeypatch, proc, "stdin")
+
+    with pytest.raises(OSError, match="cannot close"):
+        reader.close()
+
+    assert proc.returncode == -signal.SIGKILL
+
+
+def test_close_failure_keeps_the_error_already_in_flight_as_context(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reader = CommitReader(dir=git_repo.dir)
+    _fail_after_closing(monkeypatch, _child(reader), "stdout")
+
+    def fail_while_open() -> None:
+        with contextlib.closing(reader):
+            msg = "local history ended before the result could be proved"
+            raise IncompleteHistoryError(msg)
+
+    with pytest.raises(OSError, match="cannot close") as raised:
+        fail_while_open()
+
+    assert isinstance(raised.value.__context__, IncompleteHistoryError)
+
+
+def test_close_runs_every_step_when_closing_stdout_fails(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    reader = CommitReader(dir=git_repo.dir)
+    proc = _child(reader)
+    _fail_after_closing(monkeypatch, proc, "stdout")
+
+    with pytest.raises(OSError, match="cannot close"):
+        reader.close()
+
+    assert proc.stdin is not None
+    assert proc.stdin.closed
+    assert proc.returncode == 0
+
+
+def test_close_lets_a_healthy_child_exit_on_its_own(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    reader = CommitReader(dir=git_repo.dir)
+    assert reader.read("HEAD") is not None
+
+    reader.close()
+
+    assert _child(reader).returncode == 0
