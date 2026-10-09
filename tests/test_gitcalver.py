@@ -1723,28 +1723,44 @@ def test_hatch_source_empty_branch(git_repo: GitRepo) -> None:
     assert data["version"] == "20260410.1"
 
 
-@pytest.mark.parametrize(
-    "config",
-    [{}, {"branch": 0}, {"branch": False}, {"branch": []}],
-    ids=["absent", "zero", "false", "empty_list"],
-)
-def test_hatch_source_absent_or_falsy_branch_autodetects(
-    git_repo: GitRepo, config: dict[str, object]
-) -> None:
+def test_hatch_source_absent_branch_autodetects(git_repo: GitRepo) -> None:
     git_repo.commit_at("2026-04-10T09:00:00Z")
-    source = GitCalverSource(git_repo.dir, config)
+    source = GitCalverSource(git_repo.dir, {})
     assert source.get_version_data()["version"] == "20260410.1"
 
 
-@pytest.mark.parametrize("branch", [5, ["main"], True], ids=["int", "list", "bool"])
-def test_hatch_source_non_string_branch_is_reported(
-    git_repo: GitRepo, branch: object
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        pytest.param(option, value, id=f"{option}-{kind}")
+        for option in ("prefix", "dirty", "branch", "remote")
+        for kind, value in (
+            ("int", 5),
+            ("bool", False),
+            ("list", ["main"]),
+            ("table", {"a": 1}),
+        )
+    ],
+)
+def test_hatch_source_rejects_non_string_options(
+    git_repo: GitRepo, option: str, value: object
 ) -> None:
     git_repo.commit_at("2026-04-10T09:00:00Z")
-    source = GitCalverSource(git_repo.dir, {"branch": branch})
-    with pytest.raises(RuntimeError) as raised:
+    source = GitCalverSource(git_repo.dir, {option: value})
+    with pytest.raises(TypeError) as raised:
         source.get_version_data()
-    assert str(raised.value) == f"gitcalver: branch not found: {branch}"
+    assert str(raised.value) == f"gitcalver: {option} must be a string"
+
+
+@pytest.mark.parametrize("value", ["false", 0, 1, ["x"]])
+def test_hatch_source_rejects_non_boolean_no_dirty_hash(
+    git_repo: GitRepo, value: object
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    source = GitCalverSource(git_repo.dir, {"dirty": "-d", "no-dirty-hash": value})
+    with pytest.raises(TypeError) as raised:
+        source.get_version_data()
+    assert str(raised.value) == "gitcalver: no-dirty-hash must be a boolean"
 
 
 def test_hatch_hooks() -> None:
