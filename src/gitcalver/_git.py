@@ -37,9 +37,21 @@ def _os_error_message(e: OSError) -> str:
     return str(e)
 
 
+# A caller's pathspec settings would make the :/ pathspec that lists gitlinks
+# match nothing or fail.
+_PATHSPEC_VARIABLES = frozenset(
+    {
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    }
+)
+
+
 def _env(*, utc: bool = False) -> dict[str, str]:
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if k not in _PATHSPEC_VARIABLES},
         "GIT_NO_LAZY_FETCH": "1",
         "GIT_NO_REPLACE_OBJECTS": "1",
     }
@@ -158,15 +170,128 @@ def has_commits(dir: str | None = None) -> bool:
     raise GitError(head.stderr.strip() or "the reference HEAD names is broken")
 
 
-def is_dirty(dir: str | None = None) -> bool:
-    # status.showUntrackedFiles=no, in any config scope, makes a tree whose only
-    # change is an untracked file read clean, and the status that git runs
-    # inside each submodule reads the key too. -c reaches both; the
-    # --untracked-files option reaches only the superproject.
-    return (
-        git("-c", "status.showUntrackedFiles=normal", "status", "--porcelain", dir=dir)
-        != ""
+def _checked(*args: str, dir: str | None, env: dict[str, str]) -> str:
+    # Standard input is /dev/null because a hook git runs, such as
+    # core.fsmonitor, must not consume the caller's input. The output is bytes
+    # decoded as a file name, since paths in it are used as paths: text mode
+    # turns a CR into a line feed and decodes with the locale's charset where
+    # os.path encodes with the file system's.
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            cwd=dir,
+            env=env,
+            check=False,
+        )
+    except OSError as e:
+        raise GitError(_os_error_message(e)) from e
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="surrogateescape").strip()
+        raise GitError(stderr or f"git {' '.join(args)} failed")
+    return os.fsdecode(result.stdout)
+
+
+def _gitlinks(dir: str | None, env: dict[str, str]) -> list[str]:
+    listing = _checked(
+        "-c",
+        "core.quotePath=false",
+        "ls-files",
+        "--stage",
+        "--full-name",
+        "--",
+        ":/",
+        dir=dir,
+        env=env,
     )
+    gitlinks = []
+    # Not splitlines(), which also breaks at U+0085, U+2028 and U+2029: git
+    # leaves them unquoted in a path.
+    for line in listing.split("\n"):
+        if not line.startswith("160000 "):
+            continue
+        path = line.partition("\t")[2]
+        # Git quotes a path containing a control character, quote or backslash
+        # even with core.quotePath=false; such a gitlink cannot be entered.
+        if path.startswith('"'):
+            msg = f"cannot enter submodule with a quoted path: {path}"
+            raise GitError(msg)
+        gitlinks.append(path)
+    return gitlinks
+
+
+def _is_populated(dot_git: Path) -> bool:
+    # A path that cannot be searched may hide a populated submodule, so only a
+    # missing one reads as absent.
+    try:
+        dot_git.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as e:
+        raise GitError(str(e)) from e
+    return True
+
+
+def _worktree_changes(dir: str | None, env: dict[str, str]) -> bool:
+    # --ignore-submodules=none governs only the submodules directly below the
+    # repository it is given to, so the check repeats inside every populated
+    # one. `git submodule foreach` is no substitute: it fails on a gitlink that
+    # .gitmodules does not map.
+    #
+    # status.showUntrackedFiles=no, in any config scope, would make a tree
+    # whose only change is an untracked file read clean. Settings given with -c
+    # also reach the status that runs in each submodule, which does not inherit
+    # GIT_NO_REPLACE_OBJECTS. Rename detection would read blobs a partial clone
+    # may lack, and the optional index lock would block other git commands for
+    # the whole scan.
+    status = _checked(
+        "--no-optional-locks",
+        "-c",
+        "core.useReplaceRefs=false",
+        "-c",
+        "status.showUntrackedFiles=normal",
+        "-c",
+        "status.renames=false",
+        "status",
+        "--porcelain",
+        "--ignore-submodules=none",
+        dir=dir,
+        env=env,
+    )
+    if status:
+        return True
+    gitlinks = _gitlinks(dir, env)
+    if not gitlinks:
+        return False
+    top = _checked("rev-parse", "--show-toplevel", dir=dir, env=env).removesuffix("\n")
+    local_vars = _checked("rev-parse", "--local-env-vars", dir=dir, env=env).split()
+    # Like git's own submodule commands, clear repository variables such as
+    # GIT_INDEX_FILE, which a hook may set for the superproject, and name each
+    # gitlink's repository with GIT_DIR. Discovery would apply safe.directory,
+    # and from a gitlink whose .git is not a repository it would climb back to
+    # the superproject and recurse without end.
+    base = {
+        k: v
+        for k, v in env.items()
+        if k not in local_vars or k in {"GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"}
+    }
+    for gitlink in gitlinks:
+        sub = Path(top, gitlink)
+        dot_git = sub / ".git"
+        if not _is_populated(dot_git):
+            continue
+        if _worktree_changes(str(sub), {**base, "GIT_DIR": str(dot_git)}):
+            return True
+    return False
+
+
+def is_dirty(dir: str | None = None) -> bool:
+    """Return whether the working tree or any populated submodule has changes.
+
+    Raise GitError if git fails or a submodule cannot be inspected.
+    """
+    return _worktree_changes(dir, _env())
 
 
 def is_bare(dir: str | None = None) -> bool:

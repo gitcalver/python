@@ -242,6 +242,445 @@ def test_submodule_untracked_dirty_when_show_untracked_files_disabled(
     assert out.startswith("20260410.1-dirty.")
 
 
+def _source_repo(tmp_path_factory: pytest.TempPathFactory, name: str) -> GitRepo:
+    directory = str(tmp_path_factory.mktemp(name))
+    subprocess.run(
+        ["git", "init", "-b", "main", directory], capture_output=True, check=True
+    )
+    repo = GitRepo(dir=directory)
+    repo.commit_at("2026-04-10T08:00:00Z")
+    return repo
+
+
+def _add_submodule(
+    repo: GitRepo, source: GitRepo, path: str, *, ignore_all: bool = False
+) -> None:
+    repo.git("-c", "protocol.file.allow=always", "submodule", "add", source.dir, path)
+    if ignore_all:
+        repo.git("config", "-f", ".gitmodules", f"submodule.{path}.ignore", "all")
+        repo.git("add", ".gitmodules")
+
+
+def _update_submodules(repo: GitRepo) -> None:
+    repo.git(
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    )
+
+
+def _nested_chain(
+    tmp_path_factory: pytest.TempPathFactory, depth: int, *, top_name: str | None = None
+) -> tuple[GitRepo, GitRepo]:
+    names = [f"m{level}" for level in range(1, depth + 1)]
+    if top_name is not None:
+        names[-1] = top_name
+    holder = _source_repo(tmp_path_factory, "inner")
+    for level, name in enumerate(names, start=1):
+        parent = _source_repo(tmp_path_factory, f"level{level}")
+        _add_submodule(parent, holder, name, ignore_all=True)
+        parent.commit_at(f"2026-04-10T09:0{level}:00Z")
+        holder = parent
+    _update_submodules(holder)
+    innermost = Path(holder.dir, *reversed(names))
+    return holder, GitRepo(dir=str(innermost))
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        pytest.param("submodule.sub.ignore", "all", id="submodule_ignore"),
+        pytest.param("diff.ignoreSubmodules", "all", id="diff_ignore_submodules"),
+    ],
+)
+def test_moved_submodule_dirty_despite_ignore_setting_in_config(
+    git_repo: GitRepo, tmp_path_factory: pytest.TempPathFactory, key: str, value: str
+) -> None:
+    _add_submodule(git_repo, _source_repo(tmp_path_factory, "src"), "sub")
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.git("config", key, value)
+    GitRepo(dir=str(Path(git_repo.dir, "sub"))).commit_at("2026-04-10T09:01:00Z")
+    _, code = run_cmd(git_repo)
+    assert code == 2
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3])
+def test_moved_submodule_dirty_despite_gitmodules_ignore_all(
+    tmp_path_factory: pytest.TempPathFactory, depth: int
+) -> None:
+    top, innermost = _nested_chain(tmp_path_factory, depth)
+    _, code = run_cmd(top, branch="")
+    assert code == 0
+    innermost.commit_at("2026-04-10T09:10:00Z")
+    _, code = run_cmd(top, branch="")
+    assert code == 2
+
+
+def test_moved_nested_submodule_dirty_with_relative_git_work_tree(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    top, innermost = _nested_chain(tmp_path_factory, 2)
+    innermost.commit_at("2026-04-10T09:10:00Z")
+    subdir = Path(top.dir, "subdir")
+    subdir.mkdir()
+    monkeypatch.setenv("GIT_WORK_TREE", "..")
+    monkeypatch.setenv("GIT_DIR", "../.git")
+    _, code = run([], dir=str(subdir))
+    assert code == 2
+
+
+def test_submodule_check_ignores_the_superprojects_index_file(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    top, _ = _nested_chain(tmp_path_factory, 2)
+    monkeypatch.setenv("GIT_INDEX_FILE", str(Path(top.dir, ".git", "index")))
+    _, code = run([], dir=top.dir)
+    assert code == 0
+
+
+def _recording_git(bin_dir: Path, monkeypatch: pytest.MonkeyPatch, record: str) -> Path:
+    real_git = shutil.which("git")
+    assert real_git
+    log = bin_dir / "log"
+    fake_git = bin_dir / "git"
+    fake_git.write_text(
+        f"#!/bin/sh\nLOG={shlex.quote(str(log))}\n{record}\n"
+        f'exec {shlex.quote(real_git)} "$@"\n'
+    )
+    fake_git.chmod(0o755)
+    assert os.access(fake_git, os.X_OK), "tmp_path is on a noexec filesystem"
+    monkeypatch.setenv("PATH", str(bin_dir), prepend=os.pathsep)
+    return log
+
+
+def test_nested_submodule_status_keeps_git_settings_from_the_environment(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    depth = 2
+    top, _ = _nested_chain(tmp_path_factory, depth)
+    log = _recording_git(
+        tmp_path_factory.mktemp("shim"),
+        monkeypatch,
+        'if [ -n "$GIT_DIR" ]; then'
+        ' echo "$GIT_CONFIG_COUNT|$GIT_CONFIG_PARAMETERS|$GIT_NO_LAZY_FETCH|$GIT_DIR"'
+        ' >>"$LOG"; fi',
+    )
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.abbrev")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "12")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.abbrev'='12'")
+    _, code = run_cmd(top, branch="")
+    assert code == 0
+    calls = [line.rsplit("|", 1) for line in log.read_text().splitlines()]
+    assert {settings for settings, _ in calls} == {"1|'core.abbrev'='12'|1"}
+    assert len({git_dir for _, git_dir in calls}) == depth
+
+
+def test_git_in_a_submodule_does_not_read_standard_input(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    top = _source_repo(tmp_path_factory, "top")
+    _add_submodule(top, _source_repo(tmp_path_factory, "src"), "sub")
+    top.commit_at("2026-04-10T09:00:00Z")
+    log = _recording_git(
+        tmp_path_factory.mktemp("shim"),
+        monkeypatch,
+        'case "$*" in *status*|*ls-files*|*--show-toplevel*|*--local-env-vars*)'
+        ' cat >>"$LOG";; esac',
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "gitcalver", "--branch", "main"],
+        cwd=top.dir,
+        input="standard input",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert log.exists(), "the recording git never ran"
+    assert log.read_text() == ""
+
+
+def test_staged_submodule_change_dirty_despite_replace_ref(
+    git_repo: GitRepo, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    source = _source_repo(tmp_path_factory, "src")
+    source.write_file("file.txt", "one")
+    source.git("add", "file.txt")
+    source.commit_at("2026-04-10T08:30:00Z")
+    _add_submodule(git_repo, source, "sub")
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    sub = GitRepo(dir=str(Path(git_repo.dir, "sub")))
+    sub.write_file("file.txt", "two")
+    sub.git("add", "file.txt")
+    replacement = sub.git("commit-tree", sub.git("write-tree"), "-m", "replacement")
+    sub.git("replace", "HEAD", replacement)
+    _, code = run_cmd(git_repo)
+    assert code == 2
+
+
+def test_workspace_check_leaves_the_index_unchanged(git_repo: GitRepo) -> None:
+    git_repo.write_file("tracked.txt", "tracked")
+    git_repo.git("add", "tracked.txt")
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    os.utime(Path(git_repo.dir, "tracked.txt"), (1577836800, 1577836800))
+    index = Path(git_repo.dir, ".git", "index")
+    before = index.read_bytes()
+    _, code = run_cmd(git_repo)
+    assert code == 0
+    assert index.read_bytes() == before
+
+
+def test_partial_clone_staged_changes_dirty_without_blobs(
+    tmp_path: Path, partial_source: GitRepo
+) -> None:
+    clone = _clone(tmp_path, partial_source, "--filter=blob:none", "--no-checkout")
+    clone.write_file("renamed.txt", "renamed")
+    clone.git("add", "renamed.txt")
+    _, code = run_cmd(clone, branch="")
+    assert code == 2
+
+
+def test_unpopulated_submodule_is_clean(
+    tmp_path: Path, git_repo: GitRepo, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    _add_submodule(git_repo, _source_repo(tmp_path_factory, "src"), "sub")
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    out, code = run_cmd(_clone(tmp_path, git_repo), branch="")
+    assert code == 0
+    assert out == "20260410.1"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param("s\u00fcb", id="umlaut"),
+        pytest.param("s\u0085b", id="next_line"),
+        pytest.param("s\u2028b", id="line_separator"),
+        pytest.param("s\u2029b", id="paragraph_separator"),
+    ],
+)
+def test_non_ascii_submodule_path_is_entered(
+    tmp_path_factory: pytest.TempPathFactory, name: str
+) -> None:
+    top, innermost = _nested_chain(tmp_path_factory, 2, top_name=name)
+    _, code = run_cmd(top, branch="")
+    assert code == 0
+    innermost.commit_at("2026-04-10T09:10:00Z")
+    _, code = run_cmd(top, branch="")
+    assert code == 2
+
+
+def test_tracked_file_named_like_a_gitlink_listing_is_not_entered(
+    git_repo: GitRepo, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    _add_submodule(git_repo, _source_repo(tmp_path_factory, "src"), "sub")
+    git_repo.write_file("a\u2028160000 x", "tracked")
+    git_repo.git("add", "--all")
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    assert run_cmd(git_repo) == ("20260410.1", 0)
+
+
+@pytest.mark.parametrize(
+    "name", ["with\rcr", "ends-in-lf\n"], ids=["cr", "trailing_lf"]
+)
+def test_moved_nested_submodule_dirty_in_work_tree_named_with_line_breaks(
+    tmp_path_factory: pytest.TempPathFactory, name: str
+) -> None:
+    original, _ = _nested_chain(tmp_path_factory, 2)
+    renamed = tmp_path_factory.mktemp("renamed") / name
+    Path(original.dir).rename(renamed)
+    top = GitRepo(dir=str(renamed))
+    _, code = run_cmd(top, branch="")
+    assert code == 0
+    GitRepo(dir=str(renamed / "m2" / "m1")).commit_at("2026-04-10T09:10:00Z")
+    _, code = run_cmd(top, branch="")
+    assert code == 2
+
+
+def test_moved_nested_submodule_dirty_under_a_single_byte_locale(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    top, innermost = _nested_chain(tmp_path_factory, 2, top_name="s\u00fcb")
+    innermost.commit_at("2026-04-10T09:10:00Z")
+    result = subprocess.run(
+        [sys.executable, "-m", "gitcalver", "--branch", "main"],
+        cwd=top.dir,
+        env={**os.environ, "LC_ALL": "en_US.ISO8859-1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2, result.stderr
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        pytest.param({"GIT_LITERAL_PATHSPECS": "1"}, id="literal"),
+        pytest.param(
+            {"GIT_GLOB_PATHSPECS": "1", "GIT_NOGLOB_PATHSPECS": "1"},
+            id="glob_and_noglob",
+        ),
+        pytest.param({"GIT_ICASE_PATHSPECS": "garbage"}, id="invalid_icase"),
+    ],
+)
+def test_pathspec_settings_in_the_environment_do_not_change_the_workspace_check(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: dict[str, str],
+) -> None:
+    top, innermost = _nested_chain(tmp_path_factory, 2)
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+    _, code = run_cmd(top, branch="")
+    assert code == 0
+    innermost.commit_at("2026-04-10T09:10:00Z")
+    _, code = run_cmd(top, branch="")
+    assert code == 2
+
+
+def test_gitlink_directory_that_cannot_be_searched_is_incomplete_history(
+    git_repo: GitRepo,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _add_submodule(git_repo, _source_repo(tmp_path_factory, "src"), "sub")
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    stat = Path.stat
+
+    # Mode bits cannot make the directory unsearchable to root or on a
+    # filesystem that ignores them, so the lookup is refused here.
+    def refuse(path: Path, **kwargs: bool) -> os.stat_result:
+        if path.parts[-2:] == ("sub", ".git"):
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path))
+        return stat(path, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", refuse)
+    out, code = run_cmd(git_repo)
+    assert code == 4
+    assert out == "gitcalver: local history cannot prove workspace state"
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_gitlink_whose_dot_git_is_not_a_repository_is_incomplete_history(
+    git_repo: GitRepo,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+) -> None:
+    source = _source_repo(tmp_path_factory, "src")
+    git_repo.git(
+        "update-index", "--add", "--cacheinfo", f"160000,{source.head_hash()},sub"
+    )
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    # With either flag git does not look inside the gitlink, so the
+    # superproject's own status is clean and only the recursion meets it.
+    git_repo.git("update-index", flag, "sub")
+    Path(git_repo.dir, "sub", ".git").mkdir(parents=True)
+    # A status that is not given the gitlink's repository climbs back to the
+    # superproject and recurses; the fifth status fails so that it ends.
+    log = _recording_git(
+        tmp_path_factory.mktemp("shim"),
+        monkeypatch,
+        'case "$*" in *" status "*) echo status >>"$LOG";'
+        ' [ "$(wc -l <"$LOG")" -lt 5 ] || exit 99;; esac',
+    )
+    out, code = run_cmd(git_repo)
+    assert code == 4
+    assert out == "gitcalver: local history cannot prove workspace state"
+    assert len(log.read_text().splitlines()) == 2
+
+
+def _embedded_repo(repo: GitRepo, path: str) -> GitRepo:
+    directory = str(Path(repo.dir, path))
+    subprocess.run(
+        ["git", "init", "-b", "main", directory], capture_output=True, check=True
+    )
+    embedded = GitRepo(dir=directory)
+    embedded.commit_at("2026-04-10T08:00:00Z")
+    return embedded
+
+
+@pytest.mark.parametrize("change", ["untracked_file", "new_commit"])
+def test_changed_gitlink_without_gitmodules_entry_is_dirty(
+    git_repo: GitRepo, change: str
+) -> None:
+    embedded = _embedded_repo(git_repo, "embedded")
+    git_repo.git("add", "embedded")
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    assert run_cmd(git_repo) == ("20260410.1", 0)
+    if change == "untracked_file":
+        embedded.write_file("untracked.txt")
+    else:
+        embedded.commit_at("2026-04-10T09:01:00Z")
+    _, code = run_cmd(git_repo)
+    assert code == 2
+
+
+def test_moved_submodule_below_gitlink_without_gitmodules_entry_is_dirty(
+    git_repo: GitRepo, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    embedded = _embedded_repo(git_repo, "embedded")
+    _add_submodule(
+        embedded, _source_repo(tmp_path_factory, "src"), "sub", ignore_all=True
+    )
+    embedded.commit_at("2026-04-10T08:30:00Z")
+    git_repo.git("add", "embedded")
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    assert run_cmd(git_repo) == ("20260410.1", 0)
+    GitRepo(dir=str(Path(embedded.dir, "sub"))).commit_at("2026-04-10T09:01:00Z")
+    _, code = run_cmd(git_repo)
+    assert code == 2
+
+
+def test_unpopulated_gitlink_without_gitmodules_entry_is_clean(
+    tmp_path: Path, git_repo: GitRepo
+) -> None:
+    _embedded_repo(git_repo, "embedded")
+    git_repo.git("add", "embedded")
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    assert run_cmd(_clone(tmp_path, git_repo), branch="") == ("20260410.1", 0)
+
+
+def test_gitlink_with_quoted_path_is_incomplete_history(
+    git_repo: GitRepo, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    source = _source_repo(tmp_path_factory, "src")
+    git_repo.git(
+        "update-index", "--add", "--cacheinfo", f'160000,{source.head_hash()},we"ird'
+    )
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    Path(git_repo.dir, 'we"ird').mkdir()
+    out, code = run_cmd(git_repo)
+    assert code == 4
+    assert out == "gitcalver: local history cannot prove workspace state"
+
+
+def test_gitlink_listing_failure_is_incomplete_history(
+    git_repo: GitRepo,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    _intercepting_git(
+        tmp_path_factory.mktemp("shim"),
+        monkeypatch,
+        {
+            "-c core.quotePath=false ls-files --stage --full-name -- :/": (
+                128,
+                SENTINEL,
+            )
+        },
+    )
+    out, code = run_cmd(git_repo)
+    assert code == 4
+    assert out == "gitcalver: local history cannot prove workspace state"
+
+
 @pytest.mark.parametrize("setting", ["no", "normal", "all"])
 @pytest.mark.parametrize(
     "name",
@@ -1710,8 +2149,34 @@ def test_hatch_source(git_repo: GitRepo) -> None:
 
 def test_hatch_source_error(tmp_path: Path) -> None:
     source = GitCalverSource(str(tmp_path), {})
-    with pytest.raises(RuntimeError, match="not a git repository"):
+    with pytest.raises(RuntimeError) as raised:
         source.get_version_data()
+    assert str(raised.value) == NOT_A_REPO
+
+
+@pytest.mark.parametrize(
+    ("options", "want"),
+    [
+        pytest.param({}, "v0.20260410.1+dirty.{head}", id="hash"),
+        pytest.param({"no-dirty-hash": True}, "v0.20260410.1+dirty", id="no-hash"),
+    ],
+)
+def test_hatch_source_dirty(
+    git_repo: GitRepo, options: dict[str, object], want: str
+) -> None:
+    head = git_repo.commit_at("2026-04-10T09:00:00Z")
+    git_repo.write_file("dirty.txt")
+    config = {"prefix": "v0.", "dirty": "+dirty", **options}
+    source = GitCalverSource(git_repo.dir, config)
+    assert source.get_version_data()["version"] == want.format(head=head[:7])
+
+
+def test_hatch_source_no_dirty_hash_requires_dirty(git_repo: GitRepo) -> None:
+    git_repo.commit_at("2026-04-10T09:00:00Z")
+    source = GitCalverSource(git_repo.dir, {"no-dirty-hash": True})
+    with pytest.raises(RuntimeError) as raised:
+        source.get_version_data()
+    assert str(raised.value) == "gitcalver: no-dirty-hash requires dirty"
 
 
 def test_hatch_source_empty_branch(git_repo: GitRepo) -> None:
