@@ -102,7 +102,7 @@ reverse lookup. Dirty versions cannot be reversed.
 | Code | Meaning                                |
 |------|----------------------------------------|
 | 0    | Success                                |
-| 1    | Error (not a git repo, no commits, non-monotonic dates, etc.) |
+| 1    | Error (not a git repo, no commits, non-monotonic, malformed or out-of-range committer dates, etc.) |
 | 2    | Dirty workspace or off default branch (without `--dirty`) |
 | 3    | Cannot trace to default branch         |
 | 4    | Local history is insufficient to prove the result |
