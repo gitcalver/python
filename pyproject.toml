@@ -6,7 +6,7 @@ name = "gitcalver"
 dynamic = ["version"]
 description = "Deterministic calendar versioning from git history"
 # Support all non-EOL Python versions.
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"

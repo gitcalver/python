@@ -14,8 +14,8 @@ _LISTED_COMMIT = re.compile(rb"([0-9]+) commit ([0-9a-f]+)")
 # What follows the last ">" of a person line, as git's split_ident_line reads it.
 _IDENT_DATE = re.compile(rb"[ \t\r\n]*([0-9]+)[ \t\r\n]*[+-][0-9]")
 _DAY = 86400
-_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
-_MAX_EPOCH = (datetime.datetime.max.replace(tzinfo=datetime.timezone.utc) - _EPOCH) // (
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC)
+_MAX_EPOCH = (datetime.datetime.max.replace(tzinfo=datetime.UTC) - _EPOCH) // (
     datetime.timedelta(seconds=1)
 )
 
@@ -44,8 +44,7 @@ def _civil_date(epoch: int) -> str:
 
 
 def _epoch_day(date: str) -> int:
-    year, month, day = int(date[:4]), int(date[4:6]), int(date[6:8])
-    return (datetime.date(year, month, day) - _EPOCH.date()).days
+    return (datetime.date.fromisoformat(date) - _EPOCH.date()).days
 
 
 def _decreasing(found: int, after: int) -> ExitError:

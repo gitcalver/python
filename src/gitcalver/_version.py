@@ -207,7 +207,7 @@ def reverse(
     n = match.group(2)
 
     try:
-        datetime.date(int(date_str[:4]), int(date_str[4:6]), int(date_str[6:8]))
+        datetime.date.fromisoformat(date_str)
     except ValueError:
         msg = f"invalid date in version: {version_str}"
         raise ExitError(msg) from None

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 # Match requires-python: support all non-EOL Python versions.
-target-version = "py310"
+target-version = "py311"
 
 [lint]
 select = [

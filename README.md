@@ -159,7 +159,7 @@ source = "gitcalver"
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+
 - `git` on `$PATH`
 - Enough local commit history to prove the calculation. Shallow and partial
   clones work when the selected-chain relationship, anchor, and complete
