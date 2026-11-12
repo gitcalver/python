@@ -2,35 +2,39 @@ name: Release
 
 on:
   workflow_run:
+    # zizmor: ignore[dangerous-triggers] Only successful pushes from this repository can publish releases.
     workflows: [CI]
     types: [completed]
     branches: [main]
 
-concurrency: release
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions: {}
 
 jobs:
   tag:
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push'
+      github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-26.04
     permissions:
-      contents: write
+      contents: write # Creates release tags for the tested commit.
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7.0.1 # zizmor: ignore[artipacked] Release tags use the checkout credential.
         with:
           fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_sha }}
-      - uses: gitcalver/sh@7120f81ed76b73a797dd83e31ef0e74be43affda # v20261007.1
+          persist-credentials: true
+      - uses: gitcalver/sh@v20261007.1
         id: version
         with:
           tag-prefix: v
-          tag: 'true'
+          tag: "true"
+    name: tag
 
   publish:
     name: Publish to PyPI
@@ -41,24 +45,21 @@ jobs:
       name: pypi
       url: https://pypi.org/p/gitcalver
     permissions:
-      contents: read
-      id-token: write
+      actions: read # Downloads distributions from the successful CI run.
+      id-token: write # Authenticates to PyPI through trusted publishing.
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@v8.0.2
         with:
-          fetch-depth: 0
-          ref: ${{ needs.tag.outputs.tag }}
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-        with:
-          enable-cache: true
-      - run: uv python install 3.14
-      - run: uv build
+          name: python-distribution
+          path: dist/
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
       - name: Verify distribution filenames
         env:
           VERSION: ${{ needs.tag.outputs.version }}
         run: |
           [[ -f "dist/gitcalver-$VERSION-py3-none-any.whl" ]]
           [[ -f "dist/gitcalver-$VERSION.tar.gz" ]]
-      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+      - uses: pypa/gh-action-pypi-publish@v1.14.3
         with:
           skip-existing: true

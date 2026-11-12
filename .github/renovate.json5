@@ -1,7 +1,6 @@
 {
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
-  extends: ["config:best-practices", ":semanticCommitsDisabled"],
-  platformAutomerge: true,
+  extends: ["github>shields/right-answers//renovate/base.json5"],
   customManagers: [
     {
       description: "Conformance suite pin of gitcalver/sh, bumped with its action pins",
@@ -20,16 +19,6 @@
     },
   ],
   packageRules: [
-    {
-      description: "Automerge non-major updates",
-      matchUpdateTypes: ["minor", "patch", "pin", "digest"],
-      automerge: true,
-    },
-    {
-      description: "Automerge dev dependencies",
-      matchDepTypes: ["devDependencies"],
-      automerge: true,
-    },
     {
       description: "Calendar-versioned gitcalver/sh releases",
       matchDepNames: ["gitcalver/sh"],

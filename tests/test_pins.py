@@ -5,11 +5,11 @@ import json
 import re
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parent.parent
 
-_USES = re.compile(
-    r"uses: gitcalver/sh@(?P<currentDigest>[0-9a-f]{40}) # (?P<currentValue>v\S+)"
-)
+_USES = re.compile(r"uses: gitcalver/sh@(?P<currentValue>v[0-9]{8}\.[0-9]+)")
 # A JSON5 string literal (group 1) or a comment, so that comments are skipped
 # and "//" inside a string is not mistaken for one.
 _STRING_OR_COMMENT = re.compile(r'("(?:[^"\\]|\\.)*")|//[^\n]*|/\*.*?\*/', re.DOTALL)
@@ -39,13 +39,30 @@ def _pins(patterns: list[re.Pattern[str]], path: str) -> list[tuple[str, str]]:
     ]
 
 
+def _locked_action_pins(path: str) -> list[tuple[str, str]]:
+    lockfile = yaml.safe_load((ROOT / ".github/workflows/actions.lock").read_text())
+    assert isinstance(lockfile, dict)
+    dependencies = lockfile["dependencies"]
+    assert isinstance(dependencies, dict)
+    pins: list[tuple[str, str]] = []
+    for match in _USES.finditer((ROOT / path).read_text()):
+        version = match["currentValue"]
+        locked = dependencies[f"gitcalver/sh@{version}"]
+        assert isinstance(locked, dict)
+        commit = locked["commit"]
+        assert isinstance(commit, str)
+        assert re.fullmatch(r"sha1-[0-9a-f]{40}", commit)
+        pins.append((commit.removeprefix("sha1-"), version))
+    return pins
+
+
 def test_gitcalver_sh_pins_agree() -> None:
     renovate = _renovate_patterns()
     pins = {
         "Makefile CONFORMANCE_SHA": _pins(renovate, "Makefile"),
         "ci.yml conformance ref": _pins(renovate, ".github/workflows/ci.yml"),
-        "ci.yml uses": _pins([_USES], ".github/workflows/ci.yml"),
-        "release.yml uses": _pins([_USES], ".github/workflows/release.yml"),
+        "ci.yml uses": _locked_action_pins(".github/workflows/ci.yml"),
+        "release.yml uses": _locked_action_pins(".github/workflows/release.yml"),
     }
 
     for where, found in pins.items():
