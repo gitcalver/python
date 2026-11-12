@@ -27,7 +27,7 @@ jobs:
       - run: make test
         env:
           UV_PYTHON: ${{ matrix.python-version }}
-    name: test
+    name: test (${{ matrix.python-version }})
 
   lint:
     runs-on: ubuntu-26.04
@@ -70,7 +70,7 @@ jobs:
       - run: make test-conformance CONFORMANCE_DIR=conformance-sh
         env:
           GIT_DEFAULT_HASH: ${{ matrix.object-format }}
-    name: conformance
+    name: conformance (${{ matrix.object-format }})
 
   build:
     name: Build distribution
