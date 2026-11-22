@@ -17,7 +17,7 @@ workflows:
         - 'pypa/gh-action-pypi-publish@v1.14.3'
     '.github/workflows/zizmor.yml':
         - 'actions/checkout@v7.0.1'
-        - 'zizmorcore/zizmor-action@v0.8.1'
+        - 'zizmorcore/zizmor-action@v0.9.0'
 dependencies:
     'actions/checkout@v7.0.1':
         ref: 'v7.0.1'
@@ -49,9 +49,9 @@ dependencies:
         commit: 'sha1-7120f81ed76b73a797dd83e31ef0e74be43affda'
         owner_id: 275515140
         repo_id: 1210152021
-    'github/codeql-action@9b3254085494b55a0f7c4c2b3d2d52cc712ce370':
-        ref: 'v4.39.1'
-        commit: 'sha1-9b3254085494b55a0f7c4c2b3d2d52cc712ce370'
+    'github/codeql-action@33d7b85da1a04171e211befe2c739303b9a4c066':
+        ref: 'v4.39.3'
+        commit: 'sha1-33d7b85da1a04171e211befe2c739303b9a4c066'
         owner_id: 9919
         repo_id: 259445878
     'pypa/gh-action-pypi-publish@v1.14.3':
@@ -61,10 +61,10 @@ dependencies:
         repo_id: 178055147
         uses:
             - 'actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405'
-    'zizmorcore/zizmor-action@v0.8.1':
-        ref: 'v0.8.1'
-        commit: 'sha1-45d7276c9ca790aabd705e31ca99c6185c3e76dd'
+    'zizmorcore/zizmor-action@v0.9.0':
+        ref: 'v0.9.0'
+        commit: 'sha1-bd12b495c90993a4301c73398142281a61499af3'
         owner_id: 210636713
         repo_id: 985558803
         uses:
-            - 'github/codeql-action@9b3254085494b55a0f7c4c2b3d2d52cc712ce370'
+            - 'github/codeql-action@33d7b85da1a04171e211befe2c739303b9a4c066'
