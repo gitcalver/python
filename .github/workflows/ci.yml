@@ -59,7 +59,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           repository: gitcalver/sh
-          ref: 7120f81ed76b73a797dd83e31ef0e74be43affda # v20261007.1
+          ref: a21b54bf962eded7179fe736e2d7f794d6c0696f # v20261128.2
           path: conformance-sh
           persist-credentials: false
       - uses: astral-sh/setup-uv@v10.4.0
@@ -85,7 +85,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv python install 3.14
-      - uses: gitcalver/sh@v20261007.1
+      - uses: gitcalver/sh@v20261128.2
         id: version
         with:
           dirty: +dirty
