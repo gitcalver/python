@@ -9,11 +9,11 @@ workflows:
         - 'actions/checkout@v7.0.1'
         - 'actions/upload-artifact@v7.0.2'
         - 'astral-sh/setup-uv@v10.4.0'
-        - 'gitcalver/sh@v20261007.1'
+        - 'gitcalver/sh@v20261128.2'
     '.github/workflows/release.yml':
         - 'actions/checkout@v7.0.1'
         - 'actions/download-artifact@v8.0.2'
-        - 'gitcalver/sh@v20261007.1'
+        - 'gitcalver/sh@v20261128.2'
         - 'pypa/gh-action-pypi-publish@v1.14.3'
     '.github/workflows/zizmor.yml':
         - 'actions/checkout@v7.0.1'
@@ -44,9 +44,9 @@ dependencies:
         commit: 'sha1-1db35dd8eee11c5894872e0b383ae6c406cf738d'
         owner_id: 115962839
         repo_id: 846733598
-    'gitcalver/sh@v20261007.1':
-        ref: 'v20261007.1'
-        commit: 'sha1-7120f81ed76b73a797dd83e31ef0e74be43affda'
+    'gitcalver/sh@v20261128.2':
+        ref: 'v20261128.2'
+        commit: 'sha1-a21b54bf962eded7179fe736e2d7f794d6c0696f'
         owner_id: 275515140
         repo_id: 1210152021
     'github/codeql-action@33d7b85da1a04171e211befe2c739303b9a4c066':
